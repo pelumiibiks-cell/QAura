@@ -1,0 +1,40 @@
+# secrets
+.env
+.env.local
+
+# python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# playwright
+node_modules/
+test-results/
+playwright-report/
+.playwright/
+
+# qaura runtime artifacts
+runs*/
+.qaura/
+.qaura-wakeup/
+*.trace.zip
+
+# local config (not a template — see qaura.example.yaml)
+qaura.yaml
+
+# claude harness state
+.claude/
+
+# build artifacts
+dist/
+build/
+
+# os
+.DS_Store
+Thumbs.db

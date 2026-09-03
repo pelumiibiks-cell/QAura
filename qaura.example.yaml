@@ -1,0 +1,84 @@
+# Copy to qaura.yaml and edit. Every field has a sane default in qaura/config.py,
+# so you only need to set what differs. GEMINI_API_KEY stays in .env, never here.
+
+target_url: "http://localhost:8099"
+repo_path: null          # local path to the target app's source, for bug localization
+output_dir: "runs"
+seed: 0
+
+llm_mode: auto            # auto | gemini | heuristic — auto uses gemini iff a key is present
+
+# Shown for reference only — these are already qaura/config.py's defaults. Omit a
+# block entirely (or individual keys within it) to inherit the default rather than
+# risking the two copies drifting apart.
+model_tiers:
+  planner: gemini-3.1-pro-preview
+  planner_fallback: gemini-pro-latest
+  triage: gemini-3.1-pro-preview
+  localize: gemini-3.1-pro-preview
+  fix: gemini-3.1-pro-preview
+  element_classify: gemini-3.5-flash-lite
+  invariant_candidates: gemini-3.5-flash-lite
+  visual_confirm: gemini-3.7-flash
+
+guardrails:
+  allowed_domains: ["localhost"]
+  allowed_paths: ["/**"]
+  blocked_paths: []
+  allow_destructive: false
+  max_actions_per_run: 500
+  max_requests_per_second: 5.0
+  max_wall_clock_seconds: 1800
+  max_llm_calls_per_run: 300
+  fake_email_domain: qaura.invalid
+  test_card_number: "4242424242424242"
+
+personas:
+  enabled: [curious, impatient, malicious, power_user, accessibility]
+
+auth_roles:
+  - name: user
+    storage_state_path: ".qaura/auth/user.json"
+  - name: admin
+    storage_state_path: ".qaura/auth/admin.json"
+
+# Opt-in cross-role privilege check (detectors/security.py:check_cross_role_access).
+# When `qaura run --role <name>` is given and this list is non-empty, each path here
+# is visited under that role's session afterward; a finding is raised if nothing
+# looks like it blocked access. Skipped for any role marked `is_admin: true` above,
+# since it's expected to reach these. Leave empty to skip the check entirely.
+admin_paths: []
+# admin_paths:
+#   - "/admin"
+#   - "/admin/users"
+
+# Declarative invariants checked after every action (core/invariants.py). `values`
+# maps a name to a CSS selector: one match -> a single number parsed from its text,
+# multiple matches -> a list of numbers (so `sum(...)` works over line items).
+# `expression` is a restricted comparison, not arbitrary Python — see
+# config.py:InvariantConfig for exactly what's allowed.
+#
+# Note on modeling a cart correctly: `total == sum(line_items)` is WRONG once a cart
+# supports discounts — it would flag every correctly-discounted cart as broken. The
+# subtotal (raw sum of line items, before discount) and the total (subtotal minus
+# discount) are different numbers by design; check each against what it should equal,
+# not against each other.
+invariants:
+  - name: subtotal_matches_line_items
+    description: "Subtotal must equal the sum of line-item totals (independent of any discount)"
+    container_selector: "[data-testid=cart]"
+    values:
+      subtotal: "[data-testid=cart-subtotal]"
+      line_items: "[data-testid=line-total]"
+    expression: "subtotal == sum(line_items)"
+  - name: total_reflects_discount
+    description: >
+      Total must equal subtotal minus the currently-displayed discount — this is what
+      catches a stale total after quantity changes post-coupon (the discount amount
+      or the total not being recomputed against the new subtotal)
+    container_selector: "[data-testid=cart]"
+    values:
+      total: "[data-testid=cart-total]"
+      subtotal: "[data-testid=cart-subtotal]"
+      discount: "[data-testid=cart-discount]"
+    expression: "total == subtotal - discount"
