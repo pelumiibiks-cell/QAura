@@ -61,6 +61,31 @@ def test_missing_role_session_exits_with_the_capture_command(tmp_path):
     assert not (tmp_path / "gen.yaml").exists()
 
 
+def test_missing_role_message_offers_the_login_form_alternative(tmp_path):
+    result = runner.invoke(app, [
+        "init", "--url", FIXTURE_URL, "--role", "definitely-not-captured",
+        "--no-llm", "--out", str(tmp_path / "gen.yaml"),
+    ])
+    assert result.exit_code == 1
+    assert "--login-form" in result.stdout
+
+
+def test_login_form_does_not_require_an_existing_session(tmp_path, monkeypatch):
+    """With --login-form, `--role` names the session to CREATE. Requiring it to already
+    exist makes the two flags contradict each other and leaves no way to say "log in and
+    save it under this name"."""
+    monkeypatch.setenv("QAURA_LOGIN_USER", "demo")
+    monkeypatch.setenv("QAURA_LOGIN_PASS", "demo-password")
+    monkeypatch.chdir(tmp_path)
+
+    result = runner.invoke(app, [
+        "init", "--url", FIXTURE_URL, "--role", "brand-new-role", "--login-form",
+        "--no-llm", "--max-pages", "1", "--out", str(tmp_path / "gen.yaml"),
+    ])
+    assert result.exit_code == 0, result.stdout
+    assert "No captured session" not in result.stdout
+
+
 def test_existing_output_is_not_overwritten_without_force(tmp_path):
     target = tmp_path / "gen.yaml"
     target.write_text("# do not clobber me\n", encoding="utf-8")

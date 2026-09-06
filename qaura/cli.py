@@ -235,12 +235,18 @@ def init_config(
     storage_state = None
     if role:
         storage_state = resolve_role(role)
-        if not storage_state:
-            # Deliberately harsher than `observe`/`run`, which warn and continue
-            # anonymously. Silently emitting an anonymous-only config under --role admin
-            # would look authoritative while describing the logged-out shell.
+        # With --login-form, `--role` names the session to CREATE, not one that must
+        # already exist — requiring it up front would make the two flags contradict each
+        # other and leave no way to say "log in and save it as this role".
+        if not storage_state and not login_form:
+            # Otherwise deliberately harsher than `observe`/`run`, which warn and
+            # continue anonymously. Silently emitting an anonymous-only config under
+            # --role admin would look authoritative while describing the logged-out shell.
             console.print(f"[red]No captured session for role '{role}'.[/red]")
             console.print(f"  qaura auth capture --url {url} --role {role}")
+            console.print(f"  ...or, for a plain username/password form:")
+            console.print(f"  QAURA_LOGIN_USER=... QAURA_LOGIN_PASS=... "
+                          f"qaura init --url {url} --role {role} --login-form")
             raise typer.Exit(code=1)
 
     console.print(f"Analyzing [bold]{url}[/bold] — read-only, at most {max_pages} pages.")
