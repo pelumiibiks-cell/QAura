@@ -46,6 +46,7 @@ suggested fixes.
 ```
 qaura doctor                             # verify the Gemini key and reachable models
 
+qaura init --url <url>                   # analyze a site and propose a config for it
 qaura observe <url>                      # print the distilled page model for a URL
 qaura auth capture --url <url> --role user   # save a login session for reuse
 
@@ -85,10 +86,13 @@ never reached, and embedded screenshots.
 
 ```
 qaura/
-  cli.py               all commands: run, doctor, observe, auth, replay, report, ml test/probe/genai
+  cli.py               all commands: run, init, doctor, observe, auth, replay, report, ml test/probe/genai
   config.py             qaura.yaml + .env loading (see qaura.example.yaml)
+  init/                  auto-configuration: read-only recon, inference rules, invariant synthesis,
+                         annotated YAML emission (`qaura init`)
   llm/                  Gemini provider (Interactions API), budget tracking, structured-output schemas
-  browser/               Playwright driver, page observation, actions, auth, evidence recording
+  browser/               Playwright driver, page observation, actions, auth, numeric/selector scanning,
+                         read-only request enforcement, evidence recording
   core/                  state graph, guardrails, the heuristic crawler, the LLM-driven orchestrator,
                          the planner, the invariants engine, the fuzz-input corpus
   personas/              five persona system prompts

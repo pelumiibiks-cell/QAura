@@ -317,16 +317,19 @@ def run_doctor(cfg, console) -> None:
 
     console.print("\n[bold]Checking configured tier models — reachability AND quota:[/bold]")
     console.print("[dim](makes one minimal live call per distinct model; this is what actually caught the Pro-tier quota-0 issue — a reachable-list check alone would have missed it)[/dim]")
-    # localize/invariant_candidates excluded: configured (ModelTiers has a field for
-    # each) but nothing in the codebase calls provider.complete() with either tier
-    # (see llm/base.py:Tier's docstring) — probing them would spend a live API call
-    # confirming quota for a model nothing actually uses yet.
+    # localize excluded: configured (ModelTiers has a field for it) but nothing calls
+    # provider.complete() with that tier — analysis/localize.py is deterministic (see
+    # llm/base.py:Tier's docstring) — so probing it would spend a live API call
+    # confirming quota for a model nothing actually uses yet. invariant_candidates IS
+    # probed: `qaura init` calls it, and a user finding out mid-recon that the tier is
+    # quota-blocked is exactly what doctor exists to prevent.
     configured = {
         "planner": cfg.model_tiers.planner,
         "planner_fallback": cfg.model_tiers.planner_fallback,
         "triage": cfg.model_tiers.triage,
         "fix": cfg.model_tiers.fix,
         "element_classify": cfg.model_tiers.element_classify,
+        "invariant_candidates": cfg.model_tiers.invariant_candidates,
         "visual_confirm": cfg.model_tiers.visual_confirm,
     }
     quota_blocked: list[str] = []

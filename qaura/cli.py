@@ -134,6 +134,221 @@ def observe(
     asyncio.run(_run())
 
 
+@app.command("init")
+def init_config(
+    url: str = typer.Option(..., "--url", help="Seed URL to analyze"),
+    role: str = typer.Option(None, "--role", help="Analyze through a captured auth session"),
+    out: str = typer.Option("qaura.generated.yaml", "--out", help="Where to write the proposal"),
+    max_pages: int = typer.Option(25, "--max-pages", help="Hard cap on pages visited"),
+    max_depth: int = typer.Option(2, "--max-depth", help="Link depth from the seed URL"),
+    no_llm: bool = typer.Option(False, "--no-llm",
+        help="Skip invariant synthesis. Guardrails, personas and admin paths are still inferred."),
+    interact_safe: bool = typer.Option(False, "--interact-safe",
+        help="Also click tabs and disclosure toggles to reveal hidden content. Never submits a form."),
+    login_form: bool = typer.Option(False, "--login-form",
+        help="On a login wall, try QAURA_LOGIN_USER/QAURA_LOGIN_PASS. Plain forms only — use "
+             "`qaura auth capture` for MFA/SSO. Permits exactly one POST."),
+    check: bool = typer.Option(False, "--check",
+        help="Don't generate. Report whether --config's invariant selectors still match the site."),
+    ignore_robots: bool = typer.Option(False, "--ignore-robots",
+        help="Crawl paths robots.txt disallows. For infrastructure you own."),
+    yes: bool = typer.Option(False, "--yes", help="Skip the interactive authorization prompt"),
+    force: bool = typer.Option(False, "--force", help="Overwrite an existing --out file"),
+    headless: bool = typer.Option(True, "--headless/--headed"),
+    config_path: str = typer.Option(None, "--config", "-c",
+        help="Existing config, read for the Gemini credential and model tiers. Never written to."),
+) -> None:
+    """Analyze a website and propose a qaura.yaml for it.
+
+    Runs a bounded, read-only crawl (GET and HEAD only, no form submissions), infers
+    guardrails, personas and admin paths from what it sees, synthesizes business-rule
+    invariants and validates them against captured page snapshots, then writes an
+    annotated proposal. Every value says how it was inferred and how much to trust it.
+
+    Never writes qaura.yaml. Review the output and adopt it yourself.
+    """
+    import asyncio
+    from pathlib import Path
+
+    from rich.markup import escape
+    from rich.table import Table
+
+    from qaura.browser.auth import DEFAULT_AUTH_DIR, resolve_role
+    from qaura.init import emit, infer
+    from qaura.init.candidates import annotate_durability, build_inventory, generate, sanity_filter
+    from qaura.init.consent import ConsentDeclined, is_remote_target, require_authorization
+    from qaura.init.limits import ReconLimits, recon_guardrails
+    from qaura.init.login import ADMIN_ROLE_NAMES, guidance
+    from qaura.init.recon import ChallengeDetected, probe_anon_differential, run_recon
+
+    cfg = _load_config_or_exit(config_path)
+    remote = is_remote_target(url)
+    recon_cfg = recon_guardrails(url, remote=remote)
+    limits = ReconLimits().with_overrides(
+        max_pages=max_pages, max_depth=max_depth,
+        interact_safe=interact_safe, respect_robots=not ignore_robots,
+    )
+
+    try:
+        authorization = require_authorization(
+            url, console, max_pages=max_pages,
+            rps=recon_cfg.max_requests_per_second, assume_yes=yes, login_form=login_form,
+        )
+    except ConsentDeclined as e:
+        console.print(f"[yellow]{e}[/yellow]")
+        raise typer.Exit(code=2)
+
+    if check:
+        from qaura.init.check import check_invariants
+
+        if not cfg.invariants:
+            console.print("No invariants in the loaded config — nothing to check.")
+            raise typer.Exit(code=0)
+        results = asyncio.run(check_invariants(
+            cfg, url, storage_state=resolve_role(role) if role else None, headless=headless,
+        ))
+        table = Table(title=f"Invariant selector health — {url}")
+        table.add_column("invariant")
+        table.add_column("status")
+        table.add_column("detail")
+        for item in results:
+            colour = {"holds": "green", "violated": "red"}.get(item.status, "yellow")
+            # escape(): a CSS selector is mostly square brackets, which rich parses as
+            # console markup and silently swallows — so an unescaped detail line drops
+            # the exact selector the reader needs to see.
+            table.add_row(escape(item.name), f"[{colour}]{item.status}[/{colour}]",
+                          escape(item.detail))
+        console.print(table)
+        unhealthy = [r for r in results if not r.healthy]
+        if unhealthy:
+            console.print(f"[yellow]{len(unhealthy)} of {len(results)} invariant(s) did not hold "
+                          f"cleanly on this page.[/yellow]")
+            raise typer.Exit(code=1)
+        console.print(f"[green]All {len(results)} invariant(s) still apply.[/green]")
+        raise typer.Exit(code=0)
+
+    out_path = Path(out)
+    if out_path.exists() and not force:
+        console.print(f"[red]{out_path} already exists.[/red] Pass --force to overwrite it.")
+        raise typer.Exit(code=1)
+
+    storage_state = None
+    if role:
+        storage_state = resolve_role(role)
+        if not storage_state:
+            # Deliberately harsher than `observe`/`run`, which warn and continue
+            # anonymously. Silently emitting an anonymous-only config under --role admin
+            # would look authoritative while describing the logged-out shell.
+            console.print(f"[red]No captured session for role '{role}'.[/red]")
+            console.print(f"  qaura auth capture --url {url} --role {role}")
+            raise typer.Exit(code=1)
+
+    console.print(f"Analyzing [bold]{url}[/bold] — read-only, at most {max_pages} pages.")
+    try:
+        result = asyncio.run(run_recon(
+            url, recon_cfg, limits, storage_state=storage_state, role=role,
+            headless=headless, console=console, login_form=login_form,
+            auth_dir=DEFAULT_AUTH_DIR,
+        ))
+    except ChallengeDetected as e:
+        console.print(f"[red]Bot protection detected:[/red] {e.signal.describe()}")
+        console.print("Recon stopped. A config derived from a challenge page would describe the "
+                      "challenge, not the app. No file was written.")
+        raise typer.Exit(code=3)
+
+    console.print(
+        f"  {result.attempted} navigation(s), {len(result.states)} distinct state(s), "
+        f"{result.ledger.summary()}."
+    )
+
+    if result.login.walled and not role:
+        for line in guidance(result.login, url, role, len(result.states)):
+            console.print(f"[yellow]{escape(line)}[/yellow]" if line else "")
+
+    if role and role.lower() in ADMIN_ROLE_NAMES and result.discovered_paths:
+        console.print("  Measuring which paths are actually privileged...")
+        result.admin_measured = asyncio.run(probe_anon_differential(
+            sorted(set(result.discovered_paths)), url, recon_cfg, limits, headless=headless,
+        ))
+
+    verdicts = []
+    llm_used = False
+    if not no_llm and cfg.effective_llm_mode == "gemini":
+        from qaura.llm.budget import Budget
+        from qaura.llm.gemini import GeminiProvider
+
+        entries = build_inventory(result.states)
+        if entries:
+            llm_used = True
+            console.print(f"  {len(entries)} addressable number(s) found; proposing invariants...")
+            provider = GeminiProvider(cfg.gemini_api_key, cfg.model_tiers)
+            raw = generate(provider, entries, Budget(max_calls=limits.max_llm_calls))
+            accepted, rejected = [], []
+            for candidate in raw:
+                outcome = sanity_filter(candidate, entries)
+                (accepted if hasattr(outcome, "expression") else rejected).append(outcome)
+            for bad in rejected:
+                _log.debug("candidate %r rejected: %s", bad.candidate.name, bad.reason)
+            if accepted:
+                verdicts = asyncio.run(_validate_candidates(accepted, result.snapshots, headless))
+                annotate_durability(verdicts, entries)
+        else:
+            console.print("  No addressable numbers found; skipping invariant synthesis.")
+    elif not no_llm:
+        console.print("  No Gemini credential; skipping invariant synthesis (--no-llm equivalent).")
+
+    proposal = infer.build_proposal(
+        result, verdicts,
+        command=f"qaura init --url {url}" + (f" --role {role}" if role else ""),
+        version=__version__, authorization=authorization, llm_used=llm_used,
+    )
+    rendered = emit.render_config(proposal)
+    try:
+        emit.assert_loadable(rendered)
+    except Exception as e:
+        console.print(f"[red]Generated config failed its own validation:[/red] {e}")
+        console.print("This is a bug in qaura init. No file was written.")
+        raise typer.Exit(code=4)
+
+    emit.write_generated(rendered, out_path, force=force)
+
+    table = Table(title="Proposed configuration")
+    table.add_column("field")
+    table.add_column("value", overflow="fold")
+    table.add_column("confidence")
+    for annotated in proposal.fields:
+        value = annotated.value
+        rendered_value = ", ".join(map(str, value)) if isinstance(value, list) else str(value)
+        if isinstance(value, dict):
+            rendered_value = ", ".join(f"{k}={v}" for k, v in list(value.items())[:4])
+        suffix = " (commented out)" if annotated.commented_out else ""
+        table.add_row(annotated.key, escape(rendered_value[:100]) + suffix,
+                      annotated.confidence.value)
+    console.print(table)
+
+    accepted_v = [v for v in verdicts if v.status == "accepted"]
+    console.print(
+        f"Invariants: {len(accepted_v)} accepted, "
+        f"{sum(1 for v in verdicts if v.status == 'rejected_violated')} rejected, "
+        f"{sum(1 for v in verdicts if v.status == 'unverified')} unverified."
+    )
+    console.print(f"[green]Wrote {out_path}[/green] — review it, then: "
+                  f"qaura run --config {out_path}")
+
+
+async def _validate_candidates(invariants, snapshots, headless: bool):
+    """Replays candidates against captured HTML in a context where every request is
+    aborted, so set_content() cannot re-fetch a single asset from the target."""
+    from qaura.browser.driver import ContextSpec, Driver
+    from qaura.browser.readonly import install_offline_routes
+    from qaura.init.candidates import validate
+
+    async with Driver(headless=headless) as driver:
+        async with driver.context(ContextSpec(persona="init-validate")) as (context, page):
+            await install_offline_routes(context)
+            return await validate(page, invariants, snapshots)
+
+
 auth_app = typer.Typer(help="Capture and manage storage-state auth sessions.")
 app.add_typer(auth_app, name="auth")
 

@@ -13,13 +13,14 @@ from pydantic import BaseModel
 class Tier(str, Enum):
     """Maps to a role in config.ModelTiers, not directly to a model ID.
 
-    LOCALIZE and INVARIANT_CANDIDATES are configured (config.py's ModelTiers has a
-    field for each) but no call site passes either to provider.complete() —
-    analysis/localize.py is purely deterministic (substring search, no LLM) and
-    there's no invariant-candidate generator yet. Kept as reserved tiers for that
-    future work rather than removed; `qaura doctor`'s model-reachability probe
-    excludes them so it doesn't spend a live API call confirming quota for a tier
-    nothing uses yet."""
+    INVARIANT_CANDIDATES is used by `qaura init` (init/candidates.py) to propose
+    business-rule invariants from a page's numeric inventory. It was a reserved tier for
+    a long time before that existed.
+
+    LOCALIZE is still reserved: analysis/localize.py is purely deterministic (substring
+    search, no LLM), so nothing passes this tier to provider.complete() yet. `qaura
+    doctor`'s reachability probe skips it rather than spending a live API call confirming
+    quota for a tier nothing uses."""
 
     PLANNER = "planner"
     TRIAGE = "triage"

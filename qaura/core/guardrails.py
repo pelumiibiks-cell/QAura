@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 from urllib.parse import urlsplit
 
-from playwright.async_api import Page
+from playwright.async_api import Page, Response
 
 from qaura.browser.actions import Action, ActionKind
 from qaura.browser.observe import ElementInfo, PageModel
@@ -99,16 +99,22 @@ def is_in_scope(url: str, cfg: GuardrailConfig) -> bool:
     return True
 
 
-async def guard_goto(page: Page, url: str, cfg: GuardrailConfig) -> None:
+async def guard_goto(page: Page, url: str, cfg: GuardrailConfig) -> Response | None:
     """The single choke point every navigation (crawl start, frontier jump, form
     re-anchor, cross-role probe, replay) must go through. Without this, `is_in_scope`
     is only reachable via ActionKind.NAVIGATE, which nothing in the codebase ever
     emits — every real navigation called page.goto() directly, so allowed_domains
     never actually constrained anything despite the module-level claim that "every
-    action is checked here first"."""
+    action is checked here first".
+
+    Returns Playwright's Response so a caller can read the HTTP status — `qaura init`'s
+    recon needs it to tell a 401/403 wall from a normal page, which is not recoverable
+    from the DOM alone. Playwright returns None for a same-document navigation (a
+    fragment change), so the type is Optional. Every pre-existing caller ignores the
+    return value."""
     if not is_in_scope(url, cfg):
         raise GuardrailViolation(f"navigation target out of scope: {url}")
-    await page.goto(url)
+    return await page.goto(url)
 
 
 async def enforce_scope_after_action(page: Page, cfg: GuardrailConfig) -> bool:

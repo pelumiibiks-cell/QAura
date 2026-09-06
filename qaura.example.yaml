@@ -1,5 +1,10 @@
 # Copy to qaura.yaml and edit. Every field has a sane default in qaura/config.py,
 # so you only need to set what differs. GEMINI_API_KEY stays in .env, never here.
+#
+# Or don't write this by hand at all: `qaura init --url <your-app>` analyzes a running
+# site and writes an annotated qaura.generated.yaml, including synthesized invariants
+# validated against pages it actually captured. See COMMANDS.md for what it can and
+# can't infer (auth and repo_path stay manual).
 
 target_url: "http://localhost:8099"
 repo_path: null          # local path to the target app's source, for bug localization
