@@ -10,6 +10,7 @@ hallucinated one, which needs its own handling).
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass
 from pathlib import Path
@@ -180,7 +181,9 @@ class PersonaOrchestrator:
                 await self._attach_screenshot(page, before)
 
             try:
-                action, planned, new_session = plan_next_action(
+                # Provider calls are synchronous with long timeouts, so keep them off the event loop
+                action, planned, new_session = await asyncio.to_thread(
+                    plan_next_action,
                     self.provider, self.persona.system_prompt, model, node.exercised_refs,
                     session=self._session_id, budget=self.budget,
                 )
@@ -290,7 +293,8 @@ class PersonaOrchestrator:
 
             if not rebuild_failed:
                 try:
-                    divergence = flow_detector.check(
+                    divergence = await asyncio.to_thread(
+                        flow_detector.check,
                         self.provider, action.expectation, model, new_model, description,
                         history, self.persona.name, budget=self.budget,
                     )

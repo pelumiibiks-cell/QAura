@@ -58,6 +58,18 @@ class LLMResponse:
     raw: Any = None
 
 
+class LLMParseError(ValueError):
+    """Structured output that didn't match its schema. Carries usage so the wasted call still counts against a budget."""
+
+    def __init__(self, message: str, *, usage: Usage, text: str) -> None:
+        super().__init__(message)
+        self.usage = usage
+        self.text = text
+
+    def as_response(self) -> LLMResponse:
+        return LLMResponse(text=self.text, parsed=None, usage=self.usage, session_id=None)
+
+
 class LLMProvider(Protocol):
     """One call shape covers plain completion, structured output, and vision input.
     `session` threads a provider-native conversation chain (Gemini's

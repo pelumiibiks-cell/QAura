@@ -27,7 +27,7 @@ from playwright.async_api import Page
 from qaura.browser.numerics import NumericElement
 from qaura.config import InvariantConfig
 from qaura.core.invariants import InvariantError, evaluate_expression, extract_values, validate_invariant
-from qaura.llm.base import LLMProvider, Tier
+from qaura.llm.base import LLMParseError, LLMProvider, Tier
 from qaura.llm.budget import Budget, BudgetExceeded
 from qaura.llm.schemas import InvariantCandidate, InvariantCandidateList
 
@@ -205,6 +205,10 @@ def generate(
                 input=render_inventory(group),
                 schema=InvariantCandidateList,
             )
+        except LLMParseError as e:
+            _log.warning("invariant candidate response was malformed: %s", e)
+            budget.record(Tier.INVARIANT_CANDIDATES, e.as_response())
+            continue
         except Exception:
             _log.warning("invariant candidate generation failed", exc_info=True)
             continue

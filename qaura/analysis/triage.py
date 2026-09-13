@@ -6,7 +6,7 @@ the detector's judgment is the anchor, the LLM is a check on it, not a replaceme
 """
 from __future__ import annotations
 
-from qaura.llm.base import LLMProvider, Tier
+from qaura.llm.base import LLMParseError, LLMProvider, Tier
 from qaura.llm.budget import Budget
 from qaura.llm.schemas import TriageVerdict
 from qaura.reporting.models import Finding, Severity
@@ -49,17 +49,22 @@ async def triage_finding(provider: LLMProvider, finding: Finding, budget: Budget
     if not provider.available:
         return None
 
-    response = provider.complete(
-        tier=Tier.TRIAGE,
-        system=(
-            "You are triaging an automated QA finding before it reaches a human report. "
-            "Judge whether this looks like a real bug or a likely false positive (a detector "
-            "artifact, a benign edge case, expected behavior misread as a bug), and whether "
-            "the assigned severity looks right, too high, or too low given the description."
-        ),
-        input=_build_prompt(finding),
-        schema=TriageVerdict,
-    )
+    try:
+        response = provider.complete(
+            tier=Tier.TRIAGE,
+            system=(
+                "You are triaging an automated QA finding before it reaches a human report. "
+                "Judge whether this looks like a real bug or a likely false positive (a detector "
+                "artifact, a benign edge case, expected behavior misread as a bug), and whether "
+                "the assigned severity looks right, too high, or too low given the description."
+            ),
+            input=_build_prompt(finding),
+            schema=TriageVerdict,
+        )
+    except LLMParseError as e:
+        if budget is not None:
+            budget.record(Tier.TRIAGE, e.as_response())
+        return None
     if budget is not None:
         budget.record(Tier.TRIAGE, response)
     return response.parsed

@@ -4,6 +4,8 @@ the model for, not part of the provider-agnostic interface itself.
 """
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic import BaseModel, Field
 
 
@@ -14,7 +16,10 @@ class PlannedAction(BaseModel):
     """
 
     ref: str = Field(description="The element ref to act on, e.g. 'e3'. Must be a ref that was listed.")
-    action: str = Field(description="One of: click, dblclick, fill, select, check, uncheck, key")
+    # Literal becomes an enum in the JSON schema, so structured output can't return an unknown kind
+    action: Literal["click", "dblclick", "fill", "select", "check", "uncheck", "key"] = Field(
+        description="The kind of action to take."
+    )
     value: str | None = Field(default=None, description="Text to fill, option to select, or key to press. Omit for click/dblclick/check/uncheck.")
     expectation: str = Field(description="A short, checkable statement of what should be true on the page after this action succeeds.")
     reasoning: str = Field(description="One sentence: why this action, from this persona's perspective.")
@@ -92,7 +97,7 @@ class TriageVerdict(BaseModel):
 
     is_likely_false_positive: bool
     confidence: float = Field(ge=0.0, le=1.0, description="Confidence in this verdict, not in the bug itself.")
-    severity_adjustment: str = Field(
-        description="One of: lower, keep, raise — relative to the finding's current severity."
+    severity_adjustment: Literal["lower", "keep", "raise"] = Field(
+        description="Relative to the finding's current severity."
     )
     reasoning: str = Field(description="One or two sentences explaining the verdict.")

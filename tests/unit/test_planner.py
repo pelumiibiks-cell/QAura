@@ -60,7 +60,10 @@ def test_plan_next_action_rejects_invented_ref():
 
 
 def test_plan_next_action_rejects_unknown_action_kind():
-    provider = FakeProvider(_planned_response(ref="e1", action="teleport"))
+    # The schema now rejects "teleport" itself; model_construct stands in for a provider that skips validation
+    planned = PlannedAction.model_construct(ref="e1", action="teleport", value=None, expectation="x", reasoning="r")
+    response = LLMResponse(text="{}", parsed=PlannerResponse.model_construct(action=planned), usage=Usage(), session_id=None)
+    provider = FakeProvider(response)
     with pytest.raises(PlannerError, match="unknown action kind"):
         plan_next_action(provider, "be curious", _page(), set())
 
@@ -93,3 +96,27 @@ def test_build_prompt_includes_exercised_refs_hint():
     prompt = build_prompt(_page(), {"e1"})
     assert "e1" in prompt
     assert "Already tried" in prompt
+
+
+def test_plan_next_action_records_budget_when_response_fails_to_parse():
+    from qaura.llm.base import LLMParseError
+    from qaura.llm.budget import Budget
+
+    class MalformedProvider:
+        available = True
+
+        def complete(self, **kwargs):
+            raise LLMParseError("bad json", usage=Usage(input_tokens=5, output_tokens=2), text="{")
+
+    budget = Budget(max_calls=10)
+    with pytest.raises(PlannerError, match="parsable"):
+        plan_next_action(MalformedProvider(), "be curious", _page(), set(), budget=budget)
+    assert budget.calls == 1
+    assert budget.input_tokens == 5
+
+
+def test_planned_action_schema_restricts_action_kinds():
+    schema = PlannedAction.model_json_schema()
+    assert set(schema["properties"]["action"]["enum"]) == {
+        "click", "dblclick", "fill", "select", "check", "uncheck", "key",
+    }

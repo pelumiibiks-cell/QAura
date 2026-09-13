@@ -28,9 +28,9 @@ import json
 import logging
 import time
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
-from qaura.llm.base import ImagePart, LLMResponse, Tier, Usage
+from qaura.llm.base import ImagePart, LLMParseError, LLMResponse, Tier, Usage
 
 _log = logging.getLogger("qaura.llm.gemini")
 
@@ -42,6 +42,20 @@ _log = logging.getLogger("qaura.llm.gemini")
 _MAX_RETRIES = 2
 _RETRY_BACKOFF_SECONDS = 1.0
 _REQUEST_TIMEOUT_MS = 60_000
+
+# A retry can't fix a malformed request, a bad key, or a model ID that doesn't exist
+_NON_RETRYABLE_STATUS = {400, 401, 403, 404}
+
+
+def _status_code(error: Exception) -> int | None:
+    for candidate in (
+        getattr(error, "status_code", None),
+        getattr(error, "code", None),
+        getattr(getattr(error, "response", None), "status_code", None),
+    ):
+        if isinstance(candidate, int):
+            return candidate
+    return None
 
 
 def _rate_limit_error_class():
@@ -141,7 +155,7 @@ class GeminiProvider:
                 raise  # already on the fallback model, nothing cheaper to retry with
             return client.interactions.create(model=fallback_model, **kwargs)
 
-    def _create_with_retry(self, client, tier: Tier, model: str, kwargs: dict):
+    def _create_with_retry(self, client, tier: Tier, kwargs: dict):
         """Bounded retry with exponential backoff around _create_with_quota_fallback,
         for transient failures (network blips, 5xx) — NOT for rate limits, which
         already have their own permanent per-tier downgrade above and would just fail
@@ -153,12 +167,14 @@ class GeminiProvider:
         rate_limit_cls = _rate_limit_error_class()
         last_error: Exception | None = None
         for attempt in range(_MAX_RETRIES + 1):
+            # Re-resolved every attempt so a retry after a quota fallback stays on the fallback model
+            model = self._model_for(tier)
             try:
                 return self._create_with_quota_fallback(client, tier, model, kwargs)
             except Exception as e:
                 last_error = e
                 is_rate_limit = rate_limit_cls is not None and isinstance(e, rate_limit_cls)
-                if is_rate_limit or attempt == _MAX_RETRIES:
+                if is_rate_limit or _status_code(e) in _NON_RETRYABLE_STATUS or attempt == _MAX_RETRIES:
                     raise
                 _log.debug(
                     "Gemini call failed (attempt %d/%d) — retrying: %s",
@@ -178,7 +194,6 @@ class GeminiProvider:
         session: str | None = None,
     ) -> LLMResponse:
         client = self._client_or_raise()
-        model = self._model_for(tier)
 
         parts: list = []
         if images:
@@ -202,14 +217,17 @@ class GeminiProvider:
                 "schema": schema.model_json_schema(),
             }
 
-        interaction = self._create_with_retry(client, tier, model, kwargs)
+        interaction = self._create_with_retry(client, tier, kwargs)
 
         text = getattr(interaction, "output_text", "") or ""
+        usage = _extract_usage(interaction)
         parsed = None
         if schema is not None and text:
-            parsed = schema.model_validate_json(text)
+            try:
+                parsed = schema.model_validate_json(text)
+            except ValidationError as e:
+                raise LLMParseError(f"response did not match {schema.__name__}: {e}", usage=usage, text=text) from e
 
-        usage = _extract_usage(interaction)
         session_id = getattr(interaction, "id", None)
 
         return LLMResponse(

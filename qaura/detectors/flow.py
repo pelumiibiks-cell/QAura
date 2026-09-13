@@ -12,7 +12,7 @@ plan's model-tier design.
 from __future__ import annotations
 
 from qaura.browser.observe import PageModel
-from qaura.llm.base import LLMProvider, Tier
+from qaura.llm.base import LLMParseError, LLMProvider, Tier
 from qaura.llm.budget import Budget
 from qaura.llm.schemas import DivergenceJudgement
 from qaura.reporting.models import Evidence, Finding, ReproStep, Severity
@@ -44,16 +44,21 @@ def check(
         f"Judge whether the AFTER state actually satisfies the stated expectation."
     )
 
-    response = provider.complete(
-        tier=Tier.ELEMENT_CLASSIFY,
-        system=(
-            "You are judging whether a web page's state after an action matches what "
-            "was expected. Be strict: partial or ambiguous satisfaction should count as "
-            "NOT satisfied. Judge only the stated expectation, not general page quality."
-        ),
-        input=prompt,
-        schema=DivergenceJudgement,
-    )
+    try:
+        response = provider.complete(
+            tier=Tier.ELEMENT_CLASSIFY,
+            system=(
+                "You are judging whether a web page's state after an action matches what "
+                "was expected. Be strict: partial or ambiguous satisfaction should count as "
+                "NOT satisfied. Judge only the stated expectation, not general page quality."
+            ),
+            input=prompt,
+            schema=DivergenceJudgement,
+        )
+    except LLMParseError as e:
+        if budget is not None:
+            budget.record(Tier.ELEMENT_CLASSIFY, e.as_response())
+        return None
     if budget is not None:
         budget.record(Tier.ELEMENT_CLASSIFY, response)
 
