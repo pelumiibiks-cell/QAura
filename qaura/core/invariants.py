@@ -105,12 +105,21 @@ class _SafeEval(ast.NodeVisitor):
     calls cannot do attribute access, imports, comprehensions, or arbitrary calls,
     because those node types were already rejected before eval() ever runs."""
 
-    def __init__(self, allowed_names: set[str]) -> None:
+    def __init__(self, allowed_names: set[str], list_names: set[str] | None = None) -> None:
         self.allowed_names = allowed_names
+        self.list_names = list_names or set()
+
+    def _is_sequence(self, node: ast.AST) -> bool:
+        return isinstance(node, (ast.List, ast.Tuple)) or (isinstance(node, ast.Name) and node.id in self.list_names)
 
     def generic_visit(self, node: ast.AST) -> None:
         if not isinstance(node, _ALLOWED_NODES):
             raise InvariantError(f"disallowed expression construct: {type(node).__name__}")
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Mult) and (
+            self._is_sequence(node.left) or self._is_sequence(node.right)
+        ):
+            # [0] * 10**9 exhausts memory, and repeating a list is never a meaningful business rule
+            raise InvariantError("sequence repetition (e.g. [0] * n) is not allowed")
         if isinstance(node, ast.Call):
             if not isinstance(node.func, ast.Name) or node.func.id not in _ALLOWED_BUILTINS:
                 raise InvariantError("only sum/min/max/abs/len/round may be called")
@@ -121,16 +130,29 @@ class _SafeEval(ast.NodeVisitor):
         super().generic_visit(node)
 
 
-def evaluate_expression(expression: str, values: dict[str, float | list[float]]) -> bool:
+def _parse(expression: str) -> ast.Expression:
     try:
-        tree = ast.parse(expression, mode="eval")
+        return ast.parse(expression, mode="eval")
     except SyntaxError as e:
         raise InvariantError(f"invalid expression syntax: {e}") from e
 
-    _SafeEval(allowed_names=set(values)).visit(tree)
+
+def validate_invariant(invariant: InvariantConfig) -> None:
+    """Syntax and name checks that need no page values, so a broken rule fails when the config loads."""
+    _SafeEval(allowed_names=set(invariant.values)).visit(_parse(invariant.expression))
+
+
+def evaluate_expression(expression: str, values: dict[str, float | list[float]]) -> bool:
+    tree = _parse(expression)
+    list_names = {name for name, value in values.items() if isinstance(value, list)}
+    _SafeEval(allowed_names=set(values), list_names=list_names).visit(tree)
 
     code = compile(tree, filename="<invariant>", mode="eval")
-    result = eval(code, {"__builtins__": {}}, {**_ALLOWED_BUILTINS, **values})  # noqa: S307 — pre-validated AST, see _SafeEval
+    try:
+        result = eval(code, {"__builtins__": {}}, {**_ALLOWED_BUILTINS, **values})  # noqa: S307 — pre-validated AST, see _SafeEval
+    except (ArithmeticError, TypeError, ValueError) as e:
+        # e.g. a zero on the page used as a divisor, or a list compared to a number
+        raise InvariantError(f"expression could not be evaluated: {type(e).__name__}: {e}") from e
     return bool(result)
 
 

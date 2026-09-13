@@ -26,7 +26,7 @@ from playwright.async_api import Page
 
 from qaura.browser.numerics import NumericElement
 from qaura.config import InvariantConfig
-from qaura.core.invariants import InvariantError, evaluate_expression, extract_values
+from qaura.core.invariants import InvariantError, evaluate_expression, extract_values, validate_invariant
 from qaura.llm.base import LLMProvider, Tier
 from qaura.llm.budget import Budget, BudgetExceeded
 from qaura.llm.schemas import InvariantCandidate, InvariantCandidateList
@@ -277,8 +277,9 @@ def sanity_filter(
         expression=candidate.expression,
     )
 
+    # Structural check only; plugging in 1.0 for every value rejected valid rules like a / (b - c)
     try:
-        evaluate_expression(config.expression, {name: 1.0 for name in values})
+        validate_invariant(config)
     except InvariantError as e:
         return RejectReason(candidate, f"expression rejected by the invariant engine: {e}")
 

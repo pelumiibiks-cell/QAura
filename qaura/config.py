@@ -192,6 +192,16 @@ def load_config(config_path: str | Path | None = None, cwd: Path | None = None) 
             )
 
     try:
-        return QAuraConfig(**yaml_data)
+        cfg = QAuraConfig(**yaml_data)
     except ValidationError as e:
         raise ConfigError(f"{path or '(no config file)'}: {e}") from e
+
+    # Deferred import: core/invariants.py imports this module
+    from qaura.core.invariants import InvariantError, validate_invariant
+
+    for invariant in cfg.invariants:
+        try:
+            validate_invariant(invariant)
+        except InvariantError as e:
+            raise ConfigError(f"{path or '(no config file)'}: invariant {invariant.name!r}: {e}") from e
+    return cfg

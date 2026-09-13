@@ -280,14 +280,14 @@ def assert_loadable(rendered: str) -> None:
     later: a quoting bug produces a file that looks fine and that load_config() refuses
     on the user's next run, by which point the recon that produced it is gone.
     """
-    from qaura.core.invariants import InvariantError, evaluate_expression
+    from qaura.core.invariants import InvariantError, validate_invariant
     from qaura.init.infer import validate_proposal_loads
 
     config = validate_proposal_loads(rendered)
 
     for invariant in config.invariants:
         try:
-            evaluate_expression(invariant.expression, {name: 1.0 for name in invariant.values})
+            validate_invariant(invariant)
         except InvariantError as e:
             raise ValueError(
                 f"generated invariant {invariant.name!r} has an expression the engine rejects: {e}"
