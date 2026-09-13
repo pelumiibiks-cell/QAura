@@ -51,7 +51,7 @@ async def check_invariants(
 
     async with Driver(headless=headless) as driver:
         spec = ContextSpec(persona="init-check", role=None, storage_state_path=storage_state,
-                           viewport=limits.viewports[0])
+                           viewport=limits.viewports[0], block_service_workers=True)
         async with driver.context(spec) as (context, page):
             await install_readonly_routes(context, cfg, ledger)
             page.set_default_navigation_timeout(limits.nav_timeout_ms)

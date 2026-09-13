@@ -25,6 +25,7 @@ from playwright.async_api import Page
 from qaura.browser.observe import PageModel
 from qaura.browser.auth import restrict_permissions, storage_state_path
 from qaura.browser.readonly import AllowOnce
+from qaura.config import GuardrailConfig
 from qaura.core.forms import SUBMIT_NAME_HINTS
 from qaura.core.state import url_template
 from qaura.detectors.security import _BLOCKED_TEXT_MARKERS, _LOGIN_INDICATOR_NAME_SUBSTRINGS
@@ -233,6 +234,9 @@ async def _find_username_locator(page: Page, password_locator):
     return None
 
 
+_DESTRUCTIVE_PATTERNS = [p.lower() for p in GuardrailConfig().destructive_patterns]
+
+
 async def _find_submit_locator(page: Page, password_locator):
     try:
         form = password_locator.locator("xpath=ancestor::form[1]")
@@ -251,8 +255,12 @@ async def _find_submit_locator(page: Page, password_locator):
                 text = ((await item.text_content()) or (await item.get_attribute("value")) or "").lower()
                 if not text or any(hint in text for hint in SUBMIT_NAME_HINTS):
                     return item
-            if count:
-                return loc.first
+            # No obvious submit button: take the first visible one that isn't destructive
+            for i in range(count):
+                item = loc.nth(i)
+                text = ((await item.text_content()) or (await item.get_attribute("value")) or "").lower()
+                if await item.is_visible() and not any(p in text for p in _DESTRUCTIVE_PATTERNS):
+                    return item
         except Exception:
             continue
     return None

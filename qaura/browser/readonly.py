@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 from playwright.async_api import BrowserContext, Request, Route
 
@@ -33,11 +33,17 @@ READ_ONLY_METHODS = frozenset({"GET", "HEAD"})
 # "click here to unsubscribe" links in particular are almost always GETs. Blocking
 # these is the difference between a read-only crawl and quietly logging the user out
 # or deleting a row.
-_DESTRUCTIVE_PATH_RE = re.compile(
-    r"(?:^|/)(?:logout|log-out|signout|sign-out|logoff|delete|destroy|remove|purge"
-    r"|cancel|checkout|unsubscribe|deactivate|terminate)(?:/|$|\?)",
-    re.IGNORECASE,
+_DESTRUCTIVE_WORDS = (
+    r"logout|log-out|signout|sign-out|logoff|delete|destroy|remove|purge"
+    r"|cancel|checkout|unsubscribe|deactivate|terminate"
 )
+# The word may end the segment or be followed by an extension or separator: /logout.php, /delete-account
+_DESTRUCTIVE_PATH_RE = re.compile(rf"(?:^|/)(?:{_DESTRUCTIVE_WORDS})(?:[/._?-]|$)", re.IGNORECASE)
+# ?action=delete style endpoints carry the verb in the query string instead
+_DESTRUCTIVE_QUERY_RE = re.compile(
+    rf"(?:^|&)(?:action|op|cmd|do|task)=(?:{_DESTRUCTIVE_WORDS})(?:&|$)", re.IGNORECASE,
+)
+_UNTRUSTED_RESOURCE_TYPES = {"beacon", "ping"}
 
 
 @dataclass
@@ -64,6 +70,9 @@ class AllowOnce:
         if not self.armed or self.used:
             return False
         if request.method.upper() not in self.methods:
+            return False
+        # Analytics beacons fire around the login click and must not spend the exemption
+        if getattr(request, "resource_type", None) in _UNTRUSTED_RESOURCE_TYPES:
             return False
         parts = urlsplit(request.url)
         return f"{parts.scheme}://{parts.netloc}" == self.origin
@@ -112,8 +121,9 @@ def classify(request: Request, cfg: GuardrailConfig, allow_once: AllowOnce | Non
     if request.is_navigation_request() and not is_in_scope(request.url, cfg):
         return "navigation out of scope"
 
-    path = urlsplit(request.url).path or "/"
-    if _DESTRUCTIVE_PATH_RE.search(path):
+    parts = urlsplit(request.url)
+    path = unquote(parts.path or "/")
+    if _DESTRUCTIVE_PATH_RE.search(path) or _DESTRUCTIVE_QUERY_RE.search(parts.query):
         return "destructive path pattern"
 
     return None

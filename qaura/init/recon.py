@@ -179,6 +179,11 @@ def robots_blocks(path: str, disallowed: list[str]) -> bool:
 async def fetch_route_hints(
     seed_url: str, cfg: GuardrailConfig, *, respect_robots: bool, timeout: float = 8.0
 ) -> tuple[list[str], list[str]]:
+    def _too_large(resp) -> bool:
+        declared = resp.headers.get("content-length", "")
+        size = int(declared) if declared.isdigit() else len(resp.content)
+        return size > _MAX_HINT_BYTES
+
     """Seeds the frontier from robots.txt and sitemap.xml. Two plain GETs that routinely
     surface more of a server-rendered site than link-following does, and the robots fetch
     is needed anyway to know what the site asks crawlers not to touch."""
@@ -191,16 +196,18 @@ async def fetch_route_hints(
         sitemap_urls = [urljoin(origin, "/sitemap.xml")]
         try:
             resp = await client.get(urljoin(origin, "/robots.txt"))
-            if resp.status_code == 200 and "text" in resp.headers.get("content-type", "text"):
+            if resp.status_code == 200 and "text" in resp.headers.get("content-type", "text") \
+                    and not _too_large(resp):
                 disallowed, declared = parse_robots(resp.text)
-                sitemap_urls = declared or sitemap_urls
+                # robots.txt can declare sitemaps on any host; only fetch ones inside scope
+                sitemap_urls = [url for url in declared if is_in_scope(url, cfg)] or sitemap_urls
         except Exception:
             _log.debug("robots.txt fetch failed for %s", origin, exc_info=True)
 
         for sitemap_url in sitemap_urls[:3]:
             try:
                 resp = await client.get(sitemap_url)
-                if resp.status_code != 200:
+                if resp.status_code != 200 or _too_large(resp):
                     continue
                 for loc in parse_sitemap(resp.text)[:200]:
                     if not is_in_scope(loc, cfg):
@@ -212,6 +219,9 @@ async def fetch_route_hints(
                 _log.debug("sitemap fetch failed for %s", sitemap_url, exc_info=True)
 
     return urls, disallowed
+
+
+_MAX_HINT_BYTES = 5 * 1024 * 1024  # a robots.txt or sitemap bigger than this isn't worth parsing
 
 
 # --- the crawl ----------------------------------------------------------------------
@@ -308,7 +318,7 @@ async def run_recon(
 
     async with Driver(headless=headless) as driver:
         spec = ContextSpec(persona="init-recon", role=role, storage_state_path=storage_state,
-                           viewport=limits.viewports[0])
+                           viewport=limits.viewports[0], block_service_workers=True)
         async with driver.context(spec) as (context, page):
             await install_readonly_routes(context, cfg, result.ledger, allow_once)
             if limits.interact_safe:
@@ -337,7 +347,7 @@ async def run_recon(
 
                 await pacer.pace()
                 result.attempted += 1
-                started = asyncio.get_event_loop().time()
+                started = asyncio.get_running_loop().time()
                 try:
                     response = await guard_goto(page, url, cfg)
                 except GuardrailViolation:
@@ -346,7 +356,7 @@ async def run_recon(
                     _log.debug("navigation failed for %s", url, exc_info=True)
                     continue
                 result.nav_latencies_ms.append(
-                    (asyncio.get_event_loop().time() - started) * 1000
+                    (asyncio.get_running_loop().time() - started) * 1000
                 )
                 await _settle(page, limits)
 
@@ -403,9 +413,10 @@ async def run_recon(
                         console.print(f"[{colour}]assisted login: {outcome.reason}[/{colour}]")
                     if outcome.ok:
                         # The session is live in this context now, so restart the crawl
-                        # from the seed: everything gated is suddenly reachable.
+                        # from the seed: everything gated is suddenly reachable, including
+                        # pages already marked seen because they bounced to the login wall.
                         queue.appendleft((seed_url, 0))
-                        seen.discard(url_template(seed_url))
+                        seen.clear()
                         continue
 
                 # A second load of the same URL is what identifies volatile values.
@@ -529,7 +540,7 @@ async def probe_anon_differential(
 
     async with Driver(headless=headless) as driver:
         spec = ContextSpec(persona="init-anon", role=None, storage_state_path=None,
-                           viewport=limits.viewports[0])
+                           viewport=limits.viewports[0], block_service_workers=True)
         async with driver.context(spec) as (context, page):
             await install_readonly_routes(context, cfg, ledger)
             page.set_default_navigation_timeout(limits.nav_timeout_ms)

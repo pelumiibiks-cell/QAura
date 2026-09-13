@@ -90,6 +90,32 @@ def test_get_is_allowed():
     assert classify(_Request("GET", "https://example.com/a"), _cfg(), None) is None
 
 
+@pytest.mark.parametrize("path", [
+    "/logout.php", "/delete-account", "/signout.aspx", "/user/remove_item", "/LOG%4FUT",
+])
+def test_destructive_path_variants_are_blocked(path):
+    # Regression: the pattern required "/", "?" or the end right after the word
+    assert classify(_Request("GET", f"https://example.com{path}"), _cfg(), None) == "destructive path pattern"
+
+
+@pytest.mark.parametrize("path", ["/cancellation-policy", "/removed-features", "/checkouts-report"])
+def test_words_that_only_start_with_a_destructive_verb_are_allowed(path):
+    assert classify(_Request("GET", f"https://example.com{path}"), _cfg(), None) is None
+
+
+def test_destructive_action_in_the_query_string_is_blocked():
+    request = _Request("GET", "https://example.com/account?id=4&action=delete")
+    assert classify(request, _cfg(), None) == "destructive path pattern"
+
+
+def test_allow_once_is_not_spent_by_an_analytics_beacon():
+    allow = AllowOnce(origin="https://example.com", armed=True)
+    beacon = _Request("POST", "https://example.com/collect")
+    beacon.resource_type = "ping"
+    assert classify(beacon, _cfg(), allow) is not None
+    assert allow.matches(_Request("POST", "https://example.com/login"))
+
+
 def test_head_is_allowed():
     assert classify(_Request("HEAD", "https://example.com/a"), _cfg(), None) is None
 
