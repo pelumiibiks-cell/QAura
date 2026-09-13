@@ -116,6 +116,7 @@ class RunSummary:
     coverage: dict = field(default_factory=dict)   # from core/state.py StateGraph.coverage_summary()
     llm_usage: dict | None = None    # from llm/budget.py Budget.summary(), None in heuristic mode
     trace_paths: dict[str, str] = field(default_factory=dict)  # persona -> trace.zip, only with --trace
+    notes: list[str] = field(default_factory=list)  # why a crawl or persona ended early, if it did
 
 
 @dataclass

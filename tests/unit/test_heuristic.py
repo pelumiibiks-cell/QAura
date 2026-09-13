@@ -1,7 +1,11 @@
-from qaura.browser.actions import ActionKind
+from playwright.async_api import async_playwright
+
+from qaura.browser.actions import Action, ActionKind
 from qaura.browser.observe import ElementInfo, PageModel
+from qaura.browser.recorder import Recorder
 from qaura.config import QAuraConfig
 from qaura.core.heuristic import HeuristicCrawler, _actions_for
+from qaura.reporting.models import Finding
 
 
 def test_textbox_gets_fill_and_tab_sequence():
@@ -79,3 +83,71 @@ def test_form_marked_exercised_is_not_reoffered_on_same_template():
     model2 = _search_form_model("http://shop.test/records", result_count=3)
     crawler.graph.visit(model2)
     assert crawler._next_unexercised_form(model2, "http://shop.test/records") is None
+
+
+# --- crash safety -------------------------------------------------------------
+
+_TARGET = "http://crawl.test/"
+
+
+async def _run_crawler(crawler: HeuristicCrawler):
+    async with async_playwright() as p:
+        browser = await p.chromium.launch()
+        try:
+            context = await browser.new_context()
+            await context.route(
+                "http://crawl.test/**",
+                lambda route: route.fulfill(body="<button>Go</button>", content_type="text/html"),
+            )
+            page = await context.new_page()
+            recorder = Recorder(page, context)
+            await recorder.start(trace=False)
+            return await crawler.run(page, recorder)
+        finally:
+            await browser.close()
+
+
+async def test_crawl_ends_cleanly_when_the_page_cannot_be_observed(monkeypatch):
+    import qaura.browser.observe as observe
+
+    async def broken(page):
+        raise RuntimeError("Execution context was destroyed")
+
+    monkeypatch.setattr(observe, "build_page_model", broken)
+    result = await _run_crawler(HeuristicCrawler(_TARGET, QAuraConfig()))
+    assert result.aborted_reason is not None
+    assert "could not be observed" in result.aborted_reason
+
+
+async def test_unexpected_error_mid_crawl_keeps_earlier_findings(monkeypatch):
+    async def explode(self, page, url, repro_steps, persona):
+        self.findings.append(Finding(title="found before the crash", detector="crash", url=url))
+        raise RuntimeError("detector exploded")
+
+    monkeypatch.setattr(HeuristicCrawler, "_check_per_state", explode)
+    result = await _run_crawler(HeuristicCrawler(_TARGET, QAuraConfig()))
+    assert "found before the crash" in [f.title for f in result.findings]
+    assert "RuntimeError" in result.aborted_reason
+
+
+async def test_action_that_raises_still_counts_against_the_action_cap(monkeypatch):
+    import qaura.core.heuristic as heuristic
+
+    async def raising_execute(page, model, action):
+        raise RuntimeError("timed out")
+
+    class _Page:
+        url = "http://shop.test/"
+
+    monkeypatch.setattr(heuristic, "execute", raising_execute)
+    crawler = HeuristicCrawler("http://shop.test/", QAuraConfig())
+    element = ElementInfo(ref="e1", role="button", name="Go")
+    model = PageModel(url="http://shop.test/", title="t", elements=[element])
+
+    outcome = await crawler._do_action(
+        _Page(), model, Action(kind=ActionKind.CLICK, ref="e1"), element,
+        recorder=None, persona="heuristic", state_key="s",
+    )
+    assert outcome == "ok"
+    assert crawler.limiter.actions_taken == 1
+    assert crawler.findings[0].detector == "crash"

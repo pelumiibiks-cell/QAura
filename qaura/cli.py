@@ -5,6 +5,7 @@ credential and reachable models before anything spends real API calls."""
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 
 import typer
 from rich.console import Console
@@ -47,6 +48,15 @@ def _evaluate_ci_gate(findings, fail_on: str) -> tuple[bool, list]:
         raise ValueError(f"--fail-on must be one of {sorted(_CI_SEVERITY_RANK)}, got {fail_on!r}")
     offenders = [f for f in findings if _CI_SEVERITY_RANK.get(f.severity.value, 0) >= threshold]
     return not offenders, offenders
+
+
+def _unique_dir(path: Path) -> Path:
+    """Run folders are timestamped to the second, so a second run in the same second gets a suffix."""
+    candidate, n = path, 2
+    while candidate.exists():
+        candidate = path.with_name(f"{path.name}_{n}")
+        n += 1
+    return candidate
 
 
 def _load_report_or_exit(path):
@@ -425,6 +435,10 @@ def run(
     from qaura.reporting.models import Finding, RunReport, RunSummary
 
     cfg = _load_config_or_exit(config_path)
+    if ci and fail_on.lower() not in _CI_SEVERITY_RANK:
+        # Checked up front so a typo doesn't cost a whole crawl before it's noticed
+        console.print(f"[red]--fail-on must be one of {sorted(_CI_SEVERITY_RANK)}, got {fail_on!r}[/red]")
+        raise typer.Exit(code=2)
     target = url or cfg.target_url
     if not target:
         console.print("[red]No target URL given.[/red] Pass --url or set target_url in qaura.yaml.")
@@ -443,10 +457,11 @@ def run(
         reason = "no_llm was set" if no_llm else "no Gemini credential is configured (run `qaura doctor`)"
         console.print(f"[yellow]--personas requested but {reason} — falling back to heuristic mode.[/yellow]")
 
-    out_dir = Path(out or cfg.output_dir) / datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_dir = _unique_dir(Path(out or cfg.output_dir) / datetime.now().strftime("%Y%m%d_%H%M%S"))
     screenshot_dir = Path(out_dir) / "screenshots"
     trace_dir = Path(out_dir) / "traces"
     trace_paths: dict[str, str] = {}
+    run_notes: list[str] = []
 
     # One RunLimiter and one Budget for the entire run, per guardrails.py's own
     # documented contract ("a run with 5 personas shouldn't get 5x the action
@@ -473,6 +488,8 @@ def run(
                         trace_paths["heuristic"] = str(saved)
         coverage = result.graph.coverage_summary()
         coverage["unreached"] = [f"{role}: {name!r} ({template})" for template, role, name in result.graph.unreached_elements()]
+        if result.aborted_reason:
+            run_notes.append(result.aborted_reason)
         return result.findings, coverage, None
 
     async def _run_personas() -> tuple[list[Finding], dict, dict]:
@@ -494,15 +511,24 @@ def run(
                     limiter=run_limiter, budget=run_budget,
                 )
                 spec = ContextSpec(persona=persona.name, role=role, storage_state_path=storage_state)
-                async with driver.context(spec) as (context, page):
-                    recorder = Recorder(page, context)
-                    await recorder.start(trace=trace)
-                    with console.status(f"Running persona '{persona.name}' against {target}..."):
-                        result = await orchestrator.run(page, recorder)
-                    if trace:
-                        saved = await recorder.stop_and_save_trace(trace_dir / f"{persona.name}.zip")
-                        if saved:
-                            trace_paths[persona.name] = str(saved)
+                try:
+                    async with driver.context(spec) as (context, page):
+                        recorder = Recorder(page, context)
+                        await recorder.start(trace=trace)
+                        with console.status(f"Running persona '{persona.name}' against {target}..."):
+                            result = await orchestrator.run(page, recorder)
+                        if trace:
+                            saved = await recorder.stop_and_save_trace(trace_dir / f"{persona.name}.zip")
+                            if saved:
+                                trace_paths[persona.name] = str(saved)
+                except Exception as e:
+                    # One broken persona context shouldn't cost the other personas their findings
+                    _log.debug("persona %s failed", persona.name, exc_info=True)
+                    run_notes.append(f"persona {persona.name!r} stopped early: {type(e).__name__}: {e}")
+                    all_findings.extend(orchestrator.findings)
+                    continue
+                if result.aborted_reason:
+                    run_notes.append(f"persona {persona.name!r}: {result.aborted_reason}")
 
                 all_findings.extend(result.findings)
                 persona_coverage = result.graph.coverage_summary()
@@ -564,12 +590,15 @@ def run(
         else:
             findings, coverage, llm_usage = await _run_heuristic()
             mode = "heuristic"
-        findings.extend(await _check_cross_role())
+        try:
+            findings.extend(await _check_cross_role())
+        except Exception as e:
+            run_notes.append(f"cross-role check failed: {type(e).__name__}: {e}")
         finished_at = datetime.now(timezone.utc).isoformat()
         summary = RunSummary(
             target_url=target, started_at=started_at, finished_at=finished_at,
             mode=mode, personas=persona_names if use_llm else [], coverage=coverage,
-            llm_usage=llm_usage, trace_paths=dict(trace_paths),
+            llm_usage=llm_usage, trace_paths=dict(trace_paths), notes=list(run_notes),
         )
         return RunReport(summary=summary, findings=findings)
 
@@ -702,7 +731,13 @@ def run(
         report.findings = findings
         return report
 
-    report = asyncio.run(_run())
+    try:
+        report = asyncio.run(_run())
+    except Exception as e:
+        # Crawlers keep their own partial results, so reaching here means nothing ran (e.g. no browser)
+        _log.debug("run failed", exc_info=True)
+        console.print(f"[red]Run failed before any findings were collected:[/red] {type(e).__name__}: {e}")
+        raise typer.Exit(code=1) from None
     # Save immediately after the crawl, before analysis runs — analysis makes
     # unguarded LLM calls, launches a fresh browser for replay, and walks the
     # filesystem for localization, any of which can raise. Previously report.json
@@ -743,6 +778,8 @@ def run(
 
     console.print(f"\n[bold]Run complete.[/bold] {len(report.findings)} finding(s).")
     console.print(f"Coverage: {report.summary.coverage}")
+    for note in report.summary.notes:
+        console.print(f"[yellow]Note:[/yellow] {note}")
     if report.summary.llm_usage:
         console.print(f"LLM usage: {report.summary.llm_usage}")
     if report.summary.trace_paths:
@@ -902,7 +939,7 @@ def ml_test(
 
     report = build_run_report(model, result.findings, mode="ml_artifact", metrics=result.metrics)
     gate = overall_gate(result.findings)
-    out_dir = Path(out or "runs") / f"ml_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    out_dir = _unique_dir(Path(out or "runs") / f"ml_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
     json_path = report.save_json(out_dir / "report.json")
     html_path = save_html(report, out_dir / "report.html")
 
@@ -964,7 +1001,7 @@ def ml_data(
 
     report = build_run_report(current, findings, mode="ml_data")
     gate = overall_gate(findings)
-    out_dir = Path(out or "runs") / f"ml_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    out_dir = _unique_dir(Path(out or "runs") / f"ml_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
     json_path = report.save_json(out_dir / "report.json")
     html_path = save_html(report, out_dir / "report.html")
 
@@ -1003,7 +1040,7 @@ def ml_probe(
 
     report = build_run_report(endpoint, result.findings, mode="ml_endpoint")
     gate = overall_gate(result.findings)
-    out_dir = Path(out or "runs") / f"ml_endpoint_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    out_dir = _unique_dir(Path(out or "runs") / f"ml_endpoint_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
     json_path = report.save_json(out_dir / "report.json")
     html_path = save_html(report, out_dir / "report.html")
 
@@ -1054,7 +1091,7 @@ def ml_genai(
     findings = asyncio.run(_run())
     report = build_run_report(url, findings, mode="ml_genai")
     gate = overall_gate(findings)
-    out_dir = Path(out or "runs") / f"ml_genai_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    out_dir = _unique_dir(Path(out or "runs") / f"ml_genai_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
     json_path = report.save_json(out_dir / "report.json")
     html_path = save_html(report, out_dir / "report.html")
 

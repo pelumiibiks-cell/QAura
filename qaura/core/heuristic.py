@@ -23,6 +23,7 @@ model's own sampling determinism, which isn't something this codebase controls.
 """
 from __future__ import annotations
 
+import logging
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -30,7 +31,7 @@ from pathlib import Path
 from playwright.async_api import Page
 
 from qaura.browser.actions import Action, ActionKind, ActionError, execute
-from qaura.browser.observe import ElementInfo, PageModel, build_page_model
+from qaura.browser.observe import ElementInfo, PageModel, build_page_model, try_build_page_model
 from qaura.browser.recorder import Recorder
 from qaura.config import QAuraConfig
 from qaura.core.forms import FormGroup, group_forms
@@ -54,6 +55,8 @@ from qaura.detectors import performance as performance_detector
 from qaura.detectors import security as security_detector
 from qaura.detectors import visual as visual_detector
 from qaura.reporting.models import Finding, ReproStep
+
+_log = logging.getLogger(__name__)
 
 # How many fuzz values to try per text field per visit. Small on purpose — every value
 # tried is an action against the budget, and a field gets re-tried on a future visit
@@ -105,6 +108,7 @@ class CrawlResult:
     findings: list[Finding]
     graph: StateGraph
     actions_taken: int
+    aborted_reason: str | None = None
 
 
 def _describe(action: Action, element: ElementInfo) -> str:
@@ -190,6 +194,7 @@ class HeuristicCrawler:
         # rather than genuinely making progress. Each state is tried as a frontier
         # target at most once per run.
         self._frontier_tried: set[str] = set()
+        self.aborted_reason: str | None = None
 
     def _pick_candidate(self, model: PageModel, exercised_refs: set[str]) -> ElementInfo | None:
         for el in model.elements:
@@ -324,6 +329,8 @@ class HeuristicCrawler:
             return "stale"
         except Exception as e:
             self.findings.append(_action_failed_finding(page.url, history, e, persona))
+            # A failed action still happened; without this a page of timeouts never hits the cap
+            self.limiter.record_action()
             await self._attach_screenshot(page, before)
             return "ok"
 
@@ -364,7 +371,9 @@ class HeuristicCrawler:
                 self.limiter.check_before_action()
             except BudgetStop:
                 return
-            current_model = await build_page_model(page)
+            current_model = await try_build_page_model(page)
+            if current_model is None:
+                return
             live = current_model.find(field.ref)
             if live is None or not live.enabled or not live.visible:
                 continue
@@ -384,7 +393,9 @@ class HeuristicCrawler:
                 self.limiter.check_before_action()
             except BudgetStop:
                 return
-            current_model = await build_page_model(page)
+            current_model = await try_build_page_model(page)
+            if current_model is None:
+                return
             live = current_model.find(field.ref)
             if live is None or not live.enabled or not live.visible or live.checked:
                 continue  # leave already-checked boxes and radios alone
@@ -399,7 +410,9 @@ class HeuristicCrawler:
             self.limiter.check_before_action()
         except BudgetStop:
             return
-        current_model = await build_page_model(page)
+        current_model = await try_build_page_model(page)
+        if current_model is None:
+            return
         live_submit = current_model.find(form.submit.ref)
         if live_submit is None or not live_submit.enabled or not live_submit.visible:
             return
@@ -446,10 +459,32 @@ class HeuristicCrawler:
         await self._submit_form_once(page, recorder, form, persona, state_key, hostile_ref=None, hostile_seed=0)
 
     async def run(self, page: Page, recorder: Recorder, persona: str = "heuristic") -> CrawlResult:
-        await performance_detector.setup(page)  # must run before the first goto
-        await guard_goto(page, self.target_url, self.cfg.guardrails)
-        baseline_heap = await performance_detector.read_heap_size(page)
+        baseline_heap = None
+        try:
+            await performance_detector.setup(page)  # must run before the first goto
+            await guard_goto(page, self.target_url, self.cfg.guardrails)
+            baseline_heap = await performance_detector.read_heap_size(page)
+            await self._crawl(page, recorder, persona)
+        except Exception as e:
+            # Keep everything found so far; the report records why the crawl ended early
+            self.aborted_reason = f"crawl stopped early at {page.url}: {type(e).__name__}: {e}"
+            _log.warning("%s", self.aborted_reason, exc_info=True)
+            try:
+                self._collect_from_recorder(recorder, page.url, list(self._action_history), persona)
+            except Exception:
+                _log.debug("could not collect recorder findings after an abort", exc_info=True)
 
+        # Session-level counterpart to the per-action detector batch — see
+        # detectors/performance.py:check_heap_growth's docstring for why this needs
+        # exactly two readings (start, end) rather than being wired into detect().
+        current_heap = await performance_detector.read_heap_size(page)
+        growth_finding = performance_detector.check_heap_growth(baseline_heap, current_heap, page.url, persona)
+        if growth_finding:
+            self.findings.append(growth_finding)
+
+        return CrawlResult(self.findings, self.graph, self.limiter.actions_taken, self.aborted_reason)
+
+    async def _crawl(self, page: Page, recorder: Recorder, persona: str) -> None:
         budget_stopped = False
         while True:
             try:
@@ -457,7 +492,10 @@ class HeuristicCrawler:
             except BudgetStop:
                 break
 
-            model = await build_page_model(page)
+            model = await try_build_page_model(page)
+            if model is None:
+                self.aborted_reason = f"page could not be observed at {page.url}"
+                break
             node = self.graph.visit(model)
             state_key = node.fingerprint.key()
             if node.visit_count == 1:
@@ -504,7 +542,9 @@ class HeuristicCrawler:
                     budget_stopped = True
                     break
 
-                current_model = await build_page_model(page)
+                current_model = await try_build_page_model(page)
+                if current_model is None:
+                    break
                 live = current_model.find(candidate.ref) or candidate
                 if live.bbox and self._is_below_fold(page, live.bbox):
                     await self._scroll_into_view(page, current_model, candidate.ref)
@@ -519,16 +559,6 @@ class HeuristicCrawler:
             self.graph.mark_exercised(state_key, candidate.ref, element=candidate)
             if budget_stopped:
                 break
-
-        # Session-level counterpart to the per-action detector batch above — see
-        # detectors/performance.py:check_heap_growth's docstring for why this needs
-        # exactly two readings (start, end) rather than being wired into detect().
-        current_heap = await performance_detector.read_heap_size(page)
-        growth_finding = performance_detector.check_heap_growth(baseline_heap, current_heap, page.url, persona)
-        if growth_finding:
-            self.findings.append(growth_finding)
-
-        return CrawlResult(self.findings, self.graph, self.limiter.actions_taken)
 
 
 def _action_failed_finding(url: str, history: list[ReproStep], error: Exception, persona: str) -> Finding:

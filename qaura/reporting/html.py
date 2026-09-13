@@ -64,6 +64,8 @@ _TEMPLATE = r"""<!doctype html>
   .repro-not-reproduced { background: #4b5563; color: #fff; }
   .repro-na { background: #6b7280; color: #fff; }
   .occurrence-badge { background: #374151; color: #fff; }
+  .run-notes { border-left: 3px solid #b45309; padding: 4px 12px; margin-bottom: 16px; font-size: 0.9rem; }
+  .run-notes ul { margin: 4px 0; padding-left: 18px; }
   .anchor-link { color: inherit; text-decoration: none; }
   .anchor-link:hover { text-decoration: underline; }
   pre { background: #f5f5f5; padding: 8px 10px; border-radius: 6px; overflow-x: auto;
@@ -93,6 +95,12 @@ _TEMPLATE = r"""<!doctype html>
   {% if report.summary.llm_usage %} &middot; LLM calls: {{ report.summary.llm_usage.get("calls", 0) }}
     ({{ report.summary.llm_usage.get("total_tokens", 0) }} tokens){% endif %}
 </div>
+
+{% if report.summary.notes %}
+<div class="run-notes"><strong>This run ended early or partly failed:</strong>
+  <ul>{% for note in report.summary.notes %}<li>{{ note }}</li>{% endfor %}</ul>
+</div>
+{% endif %}
 
 <div class="summary-grid">
   <div class="stat"><div class="n">{{ report.findings | length }}</div><div class="l">total findings</div></div>

@@ -17,7 +17,7 @@ from pathlib import Path
 from playwright.async_api import Page
 
 from qaura.browser.actions import Action, ActionError, ActionKind, execute
-from qaura.browser.observe import build_page_model
+from qaura.browser.observe import build_page_model, try_build_page_model
 from qaura.browser.recorder import Recorder
 from qaura.config import QAuraConfig
 from qaura.core.guardrails import (
@@ -60,6 +60,7 @@ class CrawlResult:
     graph: StateGraph
     actions_taken: int
     llm_usage: dict
+    aborted_reason: str | None = None
 
 
 def _describe(action: Action, ref: str, role: str, name: str) -> str:
@@ -95,6 +96,7 @@ class PersonaOrchestrator:
         # since Phase 1 and being an explicit deliverable from the original brief.
         self.screenshot_dir = screenshot_dir
         self._screenshot_counter = 0
+        self.aborted_reason: str | None = None
 
     def _collect_from_recorder(self, recorder: Recorder, url: str, repro_steps: list[ReproStep]) -> None:
         self.findings.extend(crash_detector.detect(recorder, url, repro_steps, self.persona.name))
@@ -132,10 +134,33 @@ class PersonaOrchestrator:
         self.findings.extend(await a11y_detector.detect(page, url, repro_steps, self.persona.name))
 
     async def run(self, page: Page, recorder: Recorder) -> CrawlResult:
-        await performance_detector.setup(page)  # must run before the first goto
-        await guard_goto(page, self.target_url, self.cfg.guardrails)
-        baseline_heap = await performance_detector.read_heap_size(page)
+        baseline_heap = None
+        try:
+            await performance_detector.setup(page)  # must run before the first goto
+            await guard_goto(page, self.target_url, self.cfg.guardrails)
+            baseline_heap = await performance_detector.read_heap_size(page)
+            await self._crawl(page, recorder)
+        except Exception as e:
+            # Same contract as HeuristicCrawler.run: keep findings, record why it stopped
+            self.aborted_reason = f"crawl stopped early at {page.url}: {type(e).__name__}: {e}"
+            _log.warning("%s", self.aborted_reason, exc_info=True)
+            try:
+                self._collect_from_recorder(recorder, page.url, list(self._action_history))
+            except Exception:
+                _log.debug("could not collect recorder findings after an abort", exc_info=True)
 
+        current_heap = await performance_detector.read_heap_size(page)
+        growth_finding = performance_detector.check_heap_growth(
+            baseline_heap, current_heap, page.url, self.persona.name,
+        )
+        if growth_finding:
+            self.findings.append(growth_finding)
+
+        return CrawlResult(
+            self.findings, self.graph, self.limiter.actions_taken, self.budget.summary(), self.aborted_reason,
+        )
+
+    async def _crawl(self, page: Page, recorder: Recorder) -> None:
         while True:
             try:
                 self.limiter.check_before_action()
@@ -143,7 +168,10 @@ class PersonaOrchestrator:
             except (BudgetStop, BudgetExceeded):
                 break
 
-            model = await build_page_model(page)
+            model = await try_build_page_model(page)
+            if model is None:
+                self.aborted_reason = f"page could not be observed at {page.url}"
+                break
             node = self.graph.visit(model)
             state_key = node.fingerprint.key()
             if node.visit_count == 1:
@@ -273,12 +301,3 @@ class PersonaOrchestrator:
                 if divergence:
                     self.findings.append(divergence)
             await self._attach_screenshot(page, before)
-
-        current_heap = await performance_detector.read_heap_size(page)
-        growth_finding = performance_detector.check_heap_growth(
-            baseline_heap, current_heap, page.url, self.persona.name,
-        )
-        if growth_finding:
-            self.findings.append(growth_finding)
-
-        return CrawlResult(self.findings, self.graph, self.limiter.actions_taken, self.budget.summary())
