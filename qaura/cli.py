@@ -92,6 +92,19 @@ def _load_report_or_exit(path):
         raise typer.Exit(code=1)
 
 
+def _check_role_or_exit(role: str | None) -> None:
+    """--role becomes a file name under .qaura/auth, so reject anything path-like before it's used."""
+    from qaura.browser.auth import validate_role_name
+
+    if role is None:
+        return
+    try:
+        validate_role_name(role)
+    except ValueError as e:
+        console.print(f"[red]{e}[/red]")
+        raise typer.Exit(code=2) from None
+
+
 def _version_callback(value: bool) -> None:
     if value:
         console.print(f"qaura {__version__}")
@@ -147,6 +160,8 @@ def observe(
     from qaura.browser.driver import ContextSpec, Driver
     from qaura.browser.observe import build_page_model
     from qaura.core.guardrails import guard_goto
+
+    _check_role_or_exit(role)
 
     async def _run() -> None:
         storage_state = resolve_role(role) if role else None
@@ -212,6 +227,7 @@ def init_config(
     from qaura.init.recon import ChallengeDetected, probe_anon_differential, run_recon
 
     cfg = _load_config_or_exit(config_path)
+    _check_role_or_exit(role)
     remote = is_remote_target(url)
     recon_cfg = recon_guardrails(url, remote=remote)
     limits = ReconLimits().with_overrides(
@@ -404,6 +420,7 @@ def auth_capture(
         console.print(f"Log in as '{ready_role}', then come back here and press Enter to save the session.")
         input()
 
+    _check_role_or_exit(role)
     path = asyncio.run(capture(url, role, on_ready=_prompt))
     console.print(f"[green]Saved session for role '{role}' to {path}[/green]")
 
@@ -459,6 +476,7 @@ def run(
         # Checked up front so a typo doesn't cost a whole crawl before it's noticed
         console.print(f"[red]--fail-on must be one of {sorted(_CI_SEVERITY_RANK)}, got {fail_on!r}[/red]")
         raise typer.Exit(code=2)
+    _check_role_or_exit(role)
     target = url or cfg.target_url
     if not target:
         console.print("[red]No target URL given.[/red] Pass --url or set target_url in qaura.yaml.")
@@ -862,6 +880,7 @@ def replay(
         raise typer.Exit(code=1)
 
     cfg = _load_config_or_exit(config_path)
+    _check_role_or_exit(role)
 
     storage_state = resolve_role(role) if role else None
     if role and not storage_state:
@@ -1098,6 +1117,7 @@ def ml_genai(
     from qaura.mltest.suites.genai import GenAIProbeConfig, run_genai_suite
     from qaura.reporting.html import save_html
 
+    _check_role_or_exit(role)
     storage_state = resolve_role(role) if role else None
     if role and not storage_state:
         console.print(f"[yellow]No captured session for role '{role}' — continuing unauthenticated.[/yellow]")

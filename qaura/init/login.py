@@ -23,6 +23,7 @@ from urllib.parse import urlsplit
 from playwright.async_api import Page
 
 from qaura.browser.observe import PageModel
+from qaura.browser.auth import restrict_permissions, storage_state_path
 from qaura.browser.readonly import AllowOnce
 from qaura.core.forms import SUBMIT_NAME_HINTS
 from qaura.core.state import url_template
@@ -367,10 +368,14 @@ async def attempt_login(
             False, f"still on a login page after submitting ({page.url})", posted=posted
         )
 
+    try:
+        out_path = storage_state_path(role, auth_dir)
+    except ValueError as e:
+        return AssistedLoginResult(False, str(e), posted=posted)
     auth_dir.mkdir(parents=True, exist_ok=True)
-    out_path = auth_dir / f"{role}.json"
     try:
         await context.storage_state(path=str(out_path))
+        restrict_permissions(out_path)
     except Exception as e:
         return AssistedLoginResult(False, f"login appeared to succeed but session save failed: {e}",
                                    posted=posted)
