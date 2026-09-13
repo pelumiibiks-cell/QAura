@@ -27,8 +27,10 @@ runs*/
 
 # local config (not a template — see qaura.example.yaml)
 qaura.yaml
+qaura.generated.yaml
 
-# claude harness state
+# editor and claude harness state
+.vscode/
 .claude/
 
 # build artifacts

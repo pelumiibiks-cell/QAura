@@ -32,7 +32,7 @@ def _load_config_or_exit(config_path: str | None):
         return load_config(config_path)
     except ConfigError as e:
         console.print(f"[red]Config error:[/red] {e}")
-        raise typer.Exit(code=1)
+        raise typer.Exit(code=1) from None
 
 
 _CI_SEVERITY_RANK = {"info": 0, "low": 1, "medium": 2, "high": 3, "critical": 4}
@@ -89,7 +89,7 @@ def _load_report_or_exit(path):
         return RunReport.load_json(path)
     except Exception as e:
         console.print(f"[red]Could not load {path} as a QAura report:[/red] {e}")
-        raise typer.Exit(code=1)
+        raise typer.Exit(code=1) from None
 
 
 def _check_role_or_exit(role: str | None) -> None:
@@ -242,7 +242,7 @@ def init_config(
         )
     except ConsentDeclined as e:
         console.print(f"[yellow]{e}[/yellow]")
-        raise typer.Exit(code=2)
+        raise typer.Exit(code=2) from None
 
     if check:
         from qaura.init.check import check_invariants
@@ -290,7 +290,7 @@ def init_config(
             # --role admin would look authoritative while describing the logged-out shell.
             console.print(f"[red]No captured session for role '{role}'.[/red]")
             console.print(f"  qaura auth capture --url {url} --role {role}")
-            console.print(f"  ...or, for a plain username/password form:")
+            console.print("  ...or, for a plain username/password form:")
             console.print(f"  QAURA_LOGIN_USER=... QAURA_LOGIN_PASS=... "
                           f"qaura init --url {url} --role {role} --login-form")
             raise typer.Exit(code=1)
@@ -306,7 +306,7 @@ def init_config(
         console.print(f"[red]Bot protection detected:[/red] {e.signal.describe()}")
         console.print("Recon stopped. A config derived from a challenge page would describe the "
                       "challenge, not the app. No file was written.")
-        raise typer.Exit(code=3)
+        raise typer.Exit(code=3) from None
 
     console.print(
         f"  {result.attempted} navigation(s), {len(result.states)} distinct state(s), "
@@ -360,7 +360,7 @@ def init_config(
     except Exception as e:
         console.print(f"[red]Generated config failed its own validation:[/red] {e}")
         console.print("This is a bug in qaura init. No file was written.")
-        raise typer.Exit(code=4)
+        raise typer.Exit(code=4) from None
 
     emit.write_generated(rendered, out_path, force=force)
 
@@ -834,7 +834,7 @@ def run(
             passed, offenders = _evaluate_ci_gate(report.findings, fail_on)
         except ValueError as e:
             console.print(f"[red]{e}[/red]")
-            raise typer.Exit(code=2)
+            raise typer.Exit(code=2) from None
         if not passed:
             console.print(
                 f"\n[bold red]CI gate: FAIL[/bold red] — {len(offenders)} finding(s) at or above "
@@ -952,7 +952,7 @@ def ml_test(
         import pandas as pd
     except ImportError:
         console.print("[red]`qaura ml test` needs the 'ml' extra:[/red] pip install -e \".[ml]\"")
-        raise typer.Exit(code=1)
+        raise typer.Exit(code=1) from None
 
     from qaura.mltest.registry import ModelLoadError, load_model
     from qaura.mltest.report import build_run_report, overall_gate
@@ -964,13 +964,13 @@ def ml_test(
         loaded_baseline = load_model(baseline) if baseline else None
     except ModelLoadError as e:
         console.print(f"[red]{e}[/red]")
-        raise typer.Exit(code=1)
+        raise typer.Exit(code=1) from None
 
     try:
         df = pd.read_csv(data)
     except (FileNotFoundError, pd.errors.ParserError, pd.errors.EmptyDataError) as e:
         console.print(f"[red]Could not read {data} as CSV:[/red] {e}")
-        raise typer.Exit(code=1)
+        raise typer.Exit(code=1) from None
     cols = [c.strip() for c in feature_cols.split(",")] if feature_cols else [
         c for c in df.columns if c not in {label_col, slice_col}
     ]
@@ -1013,7 +1013,7 @@ def ml_data(
         import pandas as pd
     except ImportError:
         console.print("[red]`qaura ml data` needs the 'ml' extra:[/red] pip install -e \".[ml]\"")
-        raise typer.Exit(code=1)
+        raise typer.Exit(code=1) from None
 
     from qaura.mltest.report import build_run_report, overall_gate
     from qaura.mltest.suites.data import check_drift, check_leakage, check_null_rate_shift, check_schema
@@ -1024,7 +1024,7 @@ def ml_data(
         current_df = pd.read_csv(current)
     except (FileNotFoundError, pd.errors.ParserError, pd.errors.EmptyDataError) as e:
         console.print(f"[red]Could not read a CSV:[/red] {e}")
-        raise typer.Exit(code=1)
+        raise typer.Exit(code=1) from None
 
     check_cols = (
         [c.strip() for c in columns.split(",")] if columns
@@ -1075,7 +1075,7 @@ def ml_probe(
         base_payload = json_lib.loads(payload)
     except json_lib.JSONDecodeError as e:
         console.print(f"[red]--payload is not valid JSON: {e}[/red]")
-        raise typer.Exit(code=1)
+        raise typer.Exit(code=1) from None
 
     with console.status(f"Probing {endpoint}..."):
         result = asyncio.run(probe_endpoint(endpoint, base_payload, method=method))

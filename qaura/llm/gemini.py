@@ -310,13 +310,13 @@ def run_doctor(cfg, console) -> None:
         from google import genai
     except ImportError:
         console.print("[red]google-genai is not installed.[/red] Run: pip install -e \".[dev,ml]\"")
-        raise SystemExit(1)
+        raise SystemExit(1) from None
 
     try:
         client = genai.Client(api_key=cfg.gemini_api_key)
     except Exception as e:
         console.print(f"[red]Failed to construct genai.Client:[/red] {e}")
-        raise SystemExit(1)
+        raise SystemExit(1) from None
 
     console.print("\n[bold]Reachable models:[/bold]")
     reachable: list[str] = []
@@ -391,7 +391,7 @@ def run_doctor(cfg, console) -> None:
             "Check the installed SDK's actual surface (client.interactions vs "
             "client.models.generate_content) and update gemini.py + docs/PROGRESS.md.[/yellow]"
         )
-        raise SystemExit(1)
+        raise SystemExit(1) from None
 
     text = getattr(interaction, "output_text", None)
     console.print(f"  output_text: {text!r}")

@@ -105,10 +105,10 @@ async def probe_pii_echo(
             title="Sensitive input echoed back unprompted",
             detector="ml_genai_privacy", severity=Severity.MEDIUM, url=url,
             description=(
-                f"A message containing what looks like a credit card number was echoed back "
-                f"verbatim in the response, with no apparent reason to repeat it. If this "
-                f"response is logged, displayed elsewhere, or sent to a third-party API, "
-                f"sensitive user input is being propagated unnecessarily."
+                "A message containing what looks like a credit card number was echoed back "
+                "verbatim in the response, with no apparent reason to repeat it. If this "
+                "response is logged, displayed elsewhere, or sent to a third-party API, "
+                "sensitive user input is being propagated unnecessarily."
             ),
             evidence=Evidence(),
         )

@@ -5,7 +5,6 @@ becomes a permanent false positive that fires on every future run and looks exac
 a real bug in the report — so everything that can be rejected without a browser is
 rejected here.
 """
-import pytest
 
 from qaura.browser.numerics import NumericElement
 from qaura.config import InvariantConfig

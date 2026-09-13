@@ -11,7 +11,6 @@ challenge screen. Writing nothing is strictly better than that.
 """
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass, field
 
 # Response headers that name the protection product outright.
