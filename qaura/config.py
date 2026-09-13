@@ -7,14 +7,20 @@ than flat env-var shaped.
 """
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Literal
 
 import yaml
-from pydantic import BaseModel, Field, ValidationError, field_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 DEFAULT_CONFIG_FILENAMES = ("qaura.yaml", "qaura.yml")
+
+_log = logging.getLogger("qaura.config")
+
+# Nested sections reject unknown keys, so a typo like `allowed_domain:` fails loudly instead of disabling a check
+_STRICT = ConfigDict(extra="forbid")
 
 
 class ConfigError(RuntimeError):
@@ -37,6 +43,8 @@ class ModelTiers(BaseModel):
     fallback in llm/gemini.py handles that one) — a dead model ID needs fixing here,
     at the source, not papered over at call time."""
 
+    model_config = _STRICT
+
     planner: str = "gemini-3.1-pro-preview"
     planner_fallback: str = "gemini-pro-latest"
     triage: str = "gemini-3.1-pro-preview"
@@ -49,6 +57,8 @@ class ModelTiers(BaseModel):
 
 class GuardrailConfig(BaseModel):
     """Executed in code by qaura/core/guardrails.py — never trust the prompt alone."""
+
+    model_config = _STRICT
 
     allowed_domains: list[str] = Field(default_factory=list)
     allowed_paths: list[str] = Field(default_factory=lambda: ["/**"])
@@ -102,6 +112,8 @@ class InvariantConfig(BaseModel):
     values plus a restricted comparison expression covers the plan's own examples
     (cart total vs. line-item sum, discount-never-increases) without either problem."""
 
+    model_config = _STRICT
+
     name: str
     description: str
     container_selector: str | None = None  # if set, `values` selectors are scoped to
@@ -111,6 +123,8 @@ class InvariantConfig(BaseModel):
 
 
 class PersonaConfig(BaseModel):
+    model_config = _STRICT
+
     enabled: list[str] = Field(
         default_factory=lambda: [
             "curious", "impatient", "malicious", "power_user", "accessibility",
@@ -119,6 +133,8 @@ class PersonaConfig(BaseModel):
 
 
 class AuthRole(BaseModel):
+    model_config = _STRICT
+
     name: str
     storage_state_path: str | None = None
     is_admin: bool = False  # true for a role that's EXPECTED to reach `admin_paths`
@@ -198,8 +214,19 @@ def load_config(config_path: str | Path | None = None, cwd: Path | None = None) 
                 f"got {type(yaml_data).__name__}"
             )
 
+    known_keys = set(QAuraConfig.model_fields) | {
+        field.alias for field in QAuraConfig.model_fields.values() if field.alias
+    }
+    unknown_keys = sorted(key for key in yaml_data if key not in known_keys)
+    if unknown_keys:
+        _log.warning("%s: ignoring unknown top-level key(s): %s", path, ", ".join(unknown_keys))
+
     try:
-        cfg = QAuraConfig(**yaml_data)
+        # pydantic-settings ranks init kwargs above env vars, so yaml passed as kwargs used to
+        # beat the environment. Re-apply whatever env/.env actually set on top of the yaml.
+        env_cfg = QAuraConfig()
+        env_overrides = env_cfg.model_dump(include=env_cfg.model_fields_set, by_alias=True)
+        cfg = QAuraConfig(**{**yaml_data, **env_overrides})
     except ValidationError as e:
         raise ConfigError(f"{path or '(no config file)'}: {e}") from e
 
