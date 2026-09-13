@@ -4,6 +4,7 @@ The contract worth testing here is mostly about what the command must NOT do: to
 qaura.yaml, reach the network without consent, or overwrite an existing proposal.
 """
 import hashlib
+import re
 
 import httpx
 import pytest
@@ -23,12 +24,17 @@ def _fixture_is_up() -> bool:
         return False
 
 
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+
 def test_init_is_registered():
     result = runner.invoke(app, ["init", "--help"])
     assert result.exit_code == 0
-    assert "--url" in result.stdout
-    assert "--login-form" in result.stdout
-    assert "--check" in result.stdout
+    # Typer forces colored help on GitHub Actions, which splits "--url" with escape codes
+    help_text = _ANSI_RE.sub("", result.stdout)
+    assert "--url" in help_text
+    assert "--login-form" in help_text
+    assert "--check" in help_text
 
 
 def test_remote_url_without_consent_exits_without_touching_the_network(monkeypatch, tmp_path):
