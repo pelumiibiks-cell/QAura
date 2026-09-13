@@ -234,12 +234,40 @@ def _repro_display(f: Finding) -> tuple[str, str]:
     return label, css_class
 
 
-def render_html(report: RunReport) -> str:
+_IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg"}
+
+
+def _screenshot_file(path_str: str, base_dir: Path | None) -> Path | None:
+    """A finding's screenshot, but only an image file, and only from inside the run folder when one is known.
+    `qaura report` accepts any report.json, so a crafted path must not pull arbitrary local files into the HTML."""
+    path = Path(path_str)
+    if path.suffix.lower() not in _IMAGE_SUFFIXES:
+        return None
+    candidates = [path]
+    if base_dir is not None:
+        # A moved or renamed run folder still has screenshots/ next to its report
+        candidates.append(base_dir / "screenshots" / path.name)
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve()
+        except OSError:
+            continue
+        if base_dir is not None and not resolved.is_relative_to(base_dir.resolve()):
+            continue
+        if resolved.is_file():
+            return resolved
+    return None
+
+
+def render_html(report: RunReport, base_dir: str | Path | None = None) -> str:
+    base = Path(base_dir) if base_dir is not None else None
     screenshots: dict[str, str] = {}
     for f in report.findings:
-        path = f.evidence.screenshot_path
-        if path and Path(path).exists():
-            screenshots[f.id] = base64.b64encode(Path(path).read_bytes()).decode("ascii")
+        if not f.evidence.screenshot_path:
+            continue
+        shot = _screenshot_file(f.evidence.screenshot_path, base)
+        if shot is not None:
+            screenshots[f.id] = base64.b64encode(shot.read_bytes()).decode("ascii")
 
     sorted_findings = sorted(
         report.findings,
@@ -260,5 +288,5 @@ def render_html(report: RunReport) -> str:
 def save_html(report: RunReport, out_path: str | Path) -> Path:
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text(render_html(report), encoding="utf-8")
+    out_path.write_text(render_html(report, base_dir=out_path.parent), encoding="utf-8")
     return out_path

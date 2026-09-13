@@ -15,18 +15,23 @@ same rule are legitimately different findings, not duplicates.
 """
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import re
 from dataclasses import dataclass
 
 from qaura.core.state import url_template
-from qaura.reporting.models import Finding
+from qaura.reporting.models import Finding, Severity
 
 _DIGIT_RUN_RE = re.compile(r"\b\d+(\.\d+)?\b")
+_QUOTED_RE = re.compile(r"(\"[^\"]*\"|'[^']*')")
+_SEVERITY_RANK = {Severity.CRITICAL: 0, Severity.HIGH: 1, Severity.MEDIUM: 2, Severity.LOW: 3, Severity.INFO: 4}
 
 
 def normalize_title(title: str) -> str:
-    return _DIGIT_RUN_RE.sub("#", title).strip().lower()
+    # Digits inside quotes belong to an element's name ("Item 2"), so only collapse the rest
+    parts = _QUOTED_RE.split(title)
+    return "".join(part if i % 2 else _DIGIT_RUN_RE.sub("#", part) for i, part in enumerate(parts)).strip().lower()
 
 
 def fingerprint(finding: Finding) -> str:
@@ -46,11 +51,12 @@ class DedupeResult:
 
 
 def dedupe(findings: list[Finding]) -> DedupeResult:
-    """Groups findings by fingerprint, keeps the earliest-created representative from
-    each group (its repro_steps are the first-observed way to trigger the bug — as
-    good a starting repro as any of the duplicates), sets `occurrence_count` to the
-    group size. Order of the surviving findings follows first appearance, not
-    severity or detector — callers sort for display if they want a different order."""
+    """Groups findings by fingerprint and keeps one copy per group: the most severe
+    member, earliest first on a tie, so a later HIGH duplicate of a LOW finding isn't
+    lost. `occurrence_count` is the sum of the group's counts, so running dedupe on
+    already-deduped findings doesn't reset them. Inputs are never mutated. Order of the
+    surviving findings follows first appearance, not severity or detector — callers
+    sort for display if they want a different order."""
     groups: dict[str, list[Finding]] = {}
     order: list[str] = []
     for f in findings:
@@ -62,9 +68,11 @@ def dedupe(findings: list[Finding]) -> DedupeResult:
 
     result: list[Finding] = []
     for key in order:
-        group = sorted(groups[key], key=lambda f: f.created_at)
-        representative = group[0]
-        representative.occurrence_count = len(group)
-        result.append(representative)
+        group = sorted(
+            groups[key],
+            key=lambda f: (_SEVERITY_RANK.get(f.severity, len(_SEVERITY_RANK)), f.created_at),
+        )
+        count = sum(f.occurrence_count for f in group)
+        result.append(dataclasses.replace(group[0], occurrence_count=count))
 
     return DedupeResult(findings=result, total_before=len(findings), total_after=len(result))

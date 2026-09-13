@@ -762,7 +762,7 @@ def run(
         repro_dir = Path(out_dir) / "repro"
         emitted = 0
         for f in findings:
-            script_path = emit_repro_script(f, repro_dir, invariants=cfg.invariants)
+            script_path = emit_repro_script(f, repro_dir, invariants=cfg.invariants, storage_state_path=storage_state)
             if script_path is not None:
                 f.repro_script_path = str(script_path)
                 emitted += 1
