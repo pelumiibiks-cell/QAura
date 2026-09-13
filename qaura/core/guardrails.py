@@ -57,8 +57,9 @@ class RunLimiter:
 
     def check_before_action(self) -> None:
         elapsed = time.monotonic() - self._start_time
-        if elapsed > self.cfg.max_wall_clock_seconds:
-            raise BudgetStop(f"wall clock cap hit: {elapsed:.0f}s > {self.cfg.max_wall_clock_seconds}s")
+        # >= so a 0s cap always stops: Windows' ~15ms clock can report 0.0 elapsed right after start
+        if elapsed >= self.cfg.max_wall_clock_seconds:
+            raise BudgetStop(f"wall clock cap hit: {elapsed:.0f}s of {self.cfg.max_wall_clock_seconds}s")
         if self.actions_taken >= self.cfg.max_actions_per_run:
             raise BudgetStop(f"action cap hit: {self.actions_taken} >= {self.cfg.max_actions_per_run}")
 
