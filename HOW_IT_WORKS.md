@@ -1,6 +1,6 @@
 # How QAura works
 
-Quick explainer of the pipeline, the moving parts, and how to read a report. For setup and the command reference, see `README.md`. For the full build history and design rationale, see `docs/PROGRESS.md`.
+Quick explainer of the pipeline, the moving parts, and how to read a report. For setup see `README.md`, for every flag of every command see `COMMANDS.md`, and for the full build history and design rationale see `docs/PROGRESS.md`.
 
 ## The idea
 
@@ -8,7 +8,45 @@ Point QAura at a running web app. It drives a real headless browser through the 
 
 A second half of the tool points the same idea at ML: trained model artifacts, live inference endpoints, and chat-shaped AI features.
 
+## The full testing pipeline
+
+This is the whole workflow, from a fresh checkout to QAura guarding every build. Each stage names the command that does it; "What each command does" further down describes every command in detail.
+
+```
+1. Set up         pip install, playwright install chromium, optional GEMINI_API_KEY in .env
+2. Check          qaura doctor                          (only needed for LLM features)
+3. Prepare        qaura auth capture  -> .qaura/auth/<role>.json         (login-gated apps)
+                  qaura init          -> qaura.generated.yaml -> review -> qaura.yaml
+                  qaura observe       -> confirm what the crawler will see
+4. Explore        qaura run           -> runs/<timestamp>/  (report, screenshots, repro scripts)
+5. Review         report.html, qaura replay, qaura report
+6. Fix + retest   pytest runs/<timestamp>/repro          (fails while the bug exists, passes once fixed)
+7. Guard          qaura run --ci --fail-on high           (CI gate)
+                  qaura run --baseline-run <prior run>    (visual regressions)
+                  qaura init --check -c qaura.yaml        (invariant selectors that stopped matching)
+
+ML side           qaura ml test | ml data | ml probe | ml genai  -> runs/ml_*/
+```
+
+**1. Set up.** Install with `pip install -e ".[dev,ml]"` and `playwright install chromium`. A `GEMINI_API_KEY` in `.env` is optional. Without one, every command still works in heuristic mode at zero API cost; with one you also get persona exploration, triage, fix suggestions and invariant synthesis. Run QAura from the project folder, because `.env`, `qaura.yaml` and `.qaura/auth/` are all looked up relative to the current directory.
+
+**2. Check the LLM setup.** `qaura doctor` confirms the key works and that every configured model tier is reachable and has quota. Skip it if you're only using `--no-llm`.
+
+**3. Prepare.** If the app needs a login, capture a session per role with `qaura auth capture`, since QAura never scripts a login itself. Then run `qaura init` against the app. It crawls read-only and proposes a config: guardrails, personas, rate caps, admin paths and, with a key, business-rule invariants checked against real pages. Review `qaura.generated.yaml` and copy what you want into `qaura.yaml`, or pass it straight to `--config`. Make sure `guardrails.allowed_domains` lists every host the app redirects between; if it's left empty, `qaura run` limits itself to the `--url` host. Finally, `qaura observe <url> --role <name>` prints what the crawler will see, which is the quickest way to spot a session that didn't work (you'll see a login form).
+
+**4. Explore.** `qaura run --url <url> --role <name> --no-llm` is the right first pass: deterministic, free, and it fills and submits every form it finds. Add `--personas curious,impatient,...` with a working key for LLM-driven exploration that also catches flows that silently do the wrong thing. Guardrails apply in both modes. Each run writes a timestamped folder under `runs/` (see the `qaura run` entry below for its contents), and analysis (dedupe, replay, repro scripts) runs automatically unless you pass `--no-analysis`.
+
+**5. Review.** Open `report.html`. Findings are sorted critical-first, and each carries a reproducibility badge: confirmed, flaky, not reproduced, or not re-checked by replay. If the run stopped early (an error mid-crawl, a persona that failed), a note at the top says why, and everything found before that point is still in the report. Use `qaura replay` to re-check findings with more attempts or under a different role, and `qaura report` to rebuild the HTML after editing `report.json`.
+
+**6. Fix and retest.** Every replayable finding gets a pytest file in `runs/<timestamp>/repro/`. With the app running, `pytest runs/<timestamp>/repro` replays each one: a test fails while its bug still reproduces and passes once the bug is fixed, so the folder doubles as a regression suite. Scripts for findings from a logged-in run replay under the same session file and skip if it's gone.
+
+**7. Guard.** In CI, `qaura run --url <url> --no-llm --ci --fail-on high` exits 1 when any finding is at or above the chosen severity. `--baseline-run runs/<prior>/report.json` flags recurring findings whose screenshot changed noticeably since a known-good run. `qaura init --check -c qaura.yaml` exits 1 when an invariant's selectors no longer match the live site, which would otherwise make the rule silently stop protecting anything.
+
+**ML side.** The `qaura ml` commands follow the same prepare, run, review, gate shape without a browser crawl (except `ml genai`): each writes a report under `runs/ml_*/` and exits 1 when its gate fails, so they drop into CI the same way.
+
 ## The one-run pipeline
+
+This zooms into stage 4: what happens inside a single `qaura run`.
 
 ```
 observe -> decide -> act -> detect   (repeated, one browser session)
@@ -42,11 +80,11 @@ observe -> decide -> act -> detect   (repeated, one browser session)
 
 Raw detector output is noisy, so nothing goes straight into the report:
 
-1. **Dedupe** (`analysis/dedupe.py`) — near-identical findings (same detector, same URL template, same normalized title) merge into one.
+1. **Dedupe** (`analysis/dedupe.py`) — near-identical findings (same detector, same URL template, same normalized title) merge into one, keeping the most severe copy and counting how many times it was seen.
 2. **Localize** — if `repo_path` is set in `qaura.yaml`, candidate source files are matched by searching the target app's repo for strings tied to the finding. Runs before triage on purpose, so an LLM-written triage note can't leak into localization's search terms.
-3. **Triage** (LLM mode only) — an LLM pass on severity and false-positive likelihood.
+3. **Triage** (needs a Gemini key, skipped with `--no-llm`) — an LLM pass on severity and false-positive likelihood.
 4. **Replay** (`analysis/replay.py`) — every finding whose detector supports it (crash, console, network, security, invariant, visual, a11y, performance) gets re-executed against a fresh browser (`--replay-attempts`, default 2) and tagged with a real reproducibility status: **confirmed** (reproduced every attempt), **flaky** (some but not all), **not reproduced** (checked, didn't reproduce), or **not applicable** (this finding's detector — e.g. `flow`, which needs an LLM and isn't persisted — genuinely isn't replayable; shown as its own honest badge rather than a fabricated `0/N`).
-5. **Fix** (LLM mode only) — a suggested fix per finding.
+5. **Fix** (needs a Gemini key, skipped with `--no-llm`) — a suggested fix per finding.
 6. **Repro script** (`reporting/repro.py`) — a runnable pytest file per finding that calls the same replay logic the CLI used, so it's provably not hand-waved: it fails against the buggy app and passes once fixed.
 
 The result is `report.json` (machine-readable) and `report.html` (one self-contained file, findings sorted critical-first, with a client-side severity/detector filter bar, visible screenshots, occurrence counts, and a coverage section naming exactly which elements were never reached).
@@ -61,7 +99,7 @@ The result is `report.json` (machine-readable) and `report.html` (one self-conta
 | power_user | Keyboard-only nav, back/forward, refresh mid-flow, pagination edges |
 | accessibility | axe-core, keyboard traps, focus order, zoom/contrast |
 
-Run one or several with `qaura run --personas curious,impatient,malicious`. Without `--personas` and without `--no-llm`, if a `GEMINI_API_KEY` is present QAura runs a single default persona; with no key at all it falls back to heuristic mode automatically (`llm_mode: auto` in config).
+Run one or several with `qaura run --personas curious,impatient,malicious`. Without `--personas`, `qaura run` explores with the heuristic crawler even when a `GEMINI_API_KEY` is set, though the key is still used for triage and fix suggestions afterwards unless you pass `--no-llm`. With `--personas` but no working key (or `llm_mode: heuristic` in config), it prints a warning and falls back to heuristic mode rather than failing.
 
 ## ML testing (`qaura ml ...`)
 
@@ -104,6 +142,34 @@ qaura ml genai --url <url> --input-ref e1 --send-ref e2 --response-selector "#ch
 ```
 
 Authenticated runs matter for anything gated behind a login: `qaura run` without `--role` only ever sees what an anonymous visitor can, which on a login-gated app is just the login/register pages. Capture a session once with `qaura auth capture`, then pass `--role <name>` to `run`/`observe`/`replay`.
+
+### What each command does
+
+**`qaura doctor`** checks the LLM side before you spend anything on it. It confirms `GEMINI_API_KEY` is set (without printing it), lists the models your key can reach, makes one small live call per configured model tier to catch tiers with zero quota, and runs a final smoke test of the API call shape QAura depends on. It writes nothing. With no key it just tells you QAura will run in heuristic mode.
+
+**`qaura init`** proposes a config for an app you haven't configured yet. It crawls up to `--max-pages` pages read-only (only GET and HEAD requests are allowed out, and logout or delete style paths are blocked even as GETs), infers guardrails, personas, rate caps and admin paths, and with a key proposes invariants that it validates against the pages it captured. It writes only `qaura.generated.yaml` (or `--out`), never `qaura.yaml`, and stops with exit 3 on a bot-protection challenge. With `--check` it instead reports whether an existing config's invariant selectors still match the site.
+
+**`qaura observe <url>`** loads one page and prints its `PageModel`: every interactive element with its ref (`e3`), role, name, value and state. This is exactly what the crawler and personas act on. Use it to confirm a captured session works, or to find the refs `qaura ml genai` needs. It writes nothing.
+
+**`qaura auth capture`** opens a visible browser at `--url`, waits while you log in by hand (MFA and SSO included), and saves the session to `.qaura/auth/<role>.json` when you press Enter. Every other command reuses it through `--role <name>`. Role names are limited to letters, digits, `_` and `-`.
+
+**`qaura auth list`** prints the roles that have a captured session.
+
+**`qaura run`** is the main test run. It drives a real browser through the target with the heuristic crawler (or LLM personas with `--personas`), checks detectors and invariants after every action, then runs analysis: dedupe, triage and fix suggestions when a key is set and `--no-llm` isn't, replay, source localization when `repo_path` is set, and repro-script generation. It writes `runs/<timestamp>/` containing `report.html`, `report.json`, `screenshots/`, `repro/` (one pytest file per replayable finding) and, with `--trace`, `traces/`. With `--ci` it exits 1 if any finding meets `--fail-on`. A bad `--fail-on` value or role name exits 2 before a browser starts.
+
+**`qaura replay <run>`** re-executes the findings in a saved run against a fresh browser (every finding whose detector replay supports, or one with `--finding-id`) and updates each finding's reproducibility in `report.json` and `report.html` in place. Pass `--role` if the original run was logged in, or the replay will see the anonymous site.
+
+**`qaura report <run>`** rebuilds `report.html` from a saved `report.json` without touching a browser, for example after hand-editing a finding. Screenshots are embedded only from the run's own folder.
+
+**`qaura ml test`** tests a trained model file against a labelled CSV: overall metrics, per-slice performance (`--slice-col`), robustness to small perturbations, calibration, fairness gaps, and regression against `--baseline`. Model files are Python pickles, so only point it at files you trust. Writes `runs/ml_<timestamp>/`.
+
+**`qaura ml data`** compares two datasets, typically training data against what the model sees in production: schema changes, per-column drift and null-rate shifts, plus a leakage scan for features suspiciously correlated with `--label-col`. Writes `runs/ml_data_<timestamp>/`.
+
+**`qaura ml probe`** sends a live inference endpoint a known-good `--payload` plus malformed, empty, oversized and wrong-type variants of it, and checks for crashes, schema violations, slow responses and different answers to identical input. Writes `runs/ml_endpoint_<timestamp>/`.
+
+**`qaura ml genai`** drives a chat feature inside the app through the browser, using the input and send-button refs from `qaura observe`, and probes it for prompt injection, jailbreaks, PII echo and broken output format. Writes `runs/ml_genai_<timestamp>/`.
+
+All four `ml` commands exit 1 when their overall gate is FAIL.
 
 ## Configuring invariants
 
