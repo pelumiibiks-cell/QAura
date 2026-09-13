@@ -10,6 +10,15 @@ Every `qaura` command available in this project, with every flag, pulled directl
 
 For what each command actually *does* under the hood, see `HOW_IT_WORKS.md`. This file is the flag-by-flag reference.
 
+## Global options
+
+These go before the command name, e.g. `qaura --verbose run --url ...`.
+
+| Flag | Meaning |
+|---|---|
+| `--verbose`, `-v` | Show debug-level diagnostics on stderr, including errors that are normally handled silently (a failed locator lookup, a detector that couldn't run) |
+| `--version` | Print the installed version and exit |
+
 ---
 
 ## `qaura doctor`
@@ -225,6 +234,24 @@ qaura ml test --model model.joblib --data eval.csv
 qaura ml test --model model.joblib --data eval.csv --slice-col group --baseline prior_model.joblib
 ```
 
+## `qaura ml data`
+
+Compares a reference CSV (usually training data) against a current one (serving or eval data): schema changes, feature drift, and null-rate shift per column. With `--label-col` it also scans `current` for features suspiciously correlated with the label, which usually means leakage. Exits 1 if the gate is FAIL.
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--reference` | required | Path to the reference CSV |
+| `--current` | required | Path to the CSV to compare against it |
+| `--columns` | columns common to both files | Comma-separated numeric columns to check for drift and null-rate shift |
+| `--label-col` | none | Also run the leakage check against `current`, using this column as the label |
+| `--feature-cols` | all columns except the label | Comma-separated; only used with `--label-col` |
+| `--out` | `runs/` | Output directory |
+
+```
+qaura ml data --reference train.csv --current serving_sample.csv
+qaura ml data --reference train.csv --current eval.csv --label-col label
+```
+
 ## `qaura ml probe`
 
 Probes a live inference endpoint with adversarial, malformed, empty, oversized, and wrong-type payloads — checks for crashes, schema violations, latency, and nondeterminism. Exits 1 if the gate is FAIL.
@@ -251,6 +278,7 @@ Drives a chat-shaped AI feature in a target app through the browser, probing pro
 | `--send-ref` | required | `PageModel` ref of the send button |
 | `--response-selector` | required | CSS selector for where the response text appears |
 | `--refusal-probe` | none | A request that *should* be refused, to check refusal consistency |
+| `--role` | none | Use a captured auth session, for a chat feature behind a login |
 | `--headless` / `--headed` | `--headless` | Show the browser or not |
 | `--out` | `runs/` | Output directory |
 

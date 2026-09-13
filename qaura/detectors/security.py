@@ -7,15 +7,10 @@ configuration needed. It checks whether the marker actually got parsed as real D
 raw string appears somewhere in a text node — string-matching innerHTML would false-
 positive on a page that correctly escaped and displayed the marker as literal text.
 
-`check_cross_role_access` is deliberately NOT auto-wired into the crawl loop. Whether
-a given URL "should" require a more-privileged role isn't something a detector can
-infer from the page alone — it needs either explicit config (an admin-only-paths list
-that doesn't exist yet) or judgment (the malicious persona's prompt already tells it
-this kind of check is in scope; an LLM persona reasoning about what to try can decide
-"let me see if /admin/settings works with just a user session" on its own). This is
-built as a well-tested, callable utility rather than forced into automatic wiring
-that would need new config surface — see docs/PROGRESS.md Phase 4 notes for the full
-reasoning and what a real wiring would need.
+`check_cross_role_access` isn't part of the per-action crawl loop, since whether a URL
+should require a more privileged role can't be inferred from the page alone. It runs
+once at the end of `qaura run --role <name>`, against each entry in the config's
+`admin_paths` list (see cli.py's `_check_cross_role`).
 """
 from __future__ import annotations
 

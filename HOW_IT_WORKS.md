@@ -68,13 +68,21 @@ Run one or several with `qaura run --personas curious,impatient,malicious`. With
 Same "actually try to break it" philosophy, aimed at models instead of pages:
 
 - `qaura ml test --model <file> --data <csv> [--slice-col group] [--baseline <file>]` — metrics, per-slice/subgroup performance, perturbation robustness, calibration, fairness gaps, and regression against a baseline model.
+- `qaura ml data --reference <csv> --current <csv> [--label-col label]` — schema changes, feature drift and null-rate shift between two datasets, plus a leakage scan when a label column is given.
 - `qaura ml probe --endpoint <url> --payload '{"x": 1}'` — hits a live inference endpoint with adversarial, malformed, empty, oversized, and wrong-type payloads; checks for crashes, schema violations, and nondeterminism on repeated identical input.
 - `qaura ml genai --url <url> --input-ref <ref> --send-ref <ref> --response-selector <css>` — drives a chat-shaped AI feature in the browser, probing prompt injection, jailbreak, PII echo, and output-contract breakage.
+
+## Generating a config (`qaura init`)
+
+Writing `qaura.yaml` by hand means guessing selectors and guardrails for an app you may not know well. `qaura init --url <url>` does a bounded, read-only crawl first (`init/recon.py`): only GET and HEAD requests leave the browser, enforced by a route handler in `browser/readonly.py`, and destructive-looking paths are blocked even as GETs. From what it sees it infers guardrails, personas, rate caps and admin paths (`init/infer.py`). With a Gemini key it also proposes business-rule invariants from the numbers on the page (`init/candidates.py`), then validates each one against the HTML it captured before writing it.
+
+The output is `qaura.generated.yaml`, never `qaura.yaml`. Every field notes how it was inferred and how confident that is, and low-confidence values are written commented out. `qaura init --check -c qaura.yaml` later reports whether an existing config's invariant selectors still match the live site. Flag details are in `COMMANDS.md`.
 
 ## Command reference
 
 ```
 qaura doctor                              # verify Gemini key + reachable models
+qaura init --url <url>                    # read-only crawl that proposes qaura.generated.yaml
 qaura observe <url> [--role <name>]       # print the distilled page model, optionally authenticated
 qaura auth capture --url <url> --role user   # save a login session for reuse
 
@@ -90,6 +98,7 @@ qaura replay runs/<timestamp> [--role <name>]   # re-confirm reproducibility for
 qaura report runs/<timestamp>             # regenerate HTML from a saved run's JSON
 
 qaura ml test --model model.joblib --data eval.csv --slice-col group --baseline prior.joblib
+qaura ml data --reference train.csv --current serving.csv [--label-col label]
 qaura ml probe --endpoint http://localhost:8000/predict --payload '{"x": 1}'
 qaura ml genai --url <url> --input-ref e1 --send-ref e2 --response-selector "#chat-response"
 ```
