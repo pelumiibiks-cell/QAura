@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import typer
 from rich.console import Console
@@ -57,6 +58,24 @@ def _unique_dir(path: Path) -> Path:
         candidate = path.with_name(f"{path.name}_{n}")
         n += 1
     return candidate
+
+
+def _default_scope(cfg, url: str) -> str | None:
+    """Empty allowed_domains means every domain, so pin an unscoped run to the target host. Returns the host if applied."""
+    if cfg.guardrails.allowed_domains:
+        return None
+    host = urlsplit(url).hostname
+    if not host:
+        return None
+    cfg.guardrails.allowed_domains = [host]
+    return host
+
+
+def _single_url_scope(url: str):
+    from qaura.config import GuardrailConfig
+
+    host = urlsplit(url).hostname
+    return GuardrailConfig(allowed_domains=[host] if host else [])
 
 
 def _load_report_or_exit(path):
@@ -127,6 +146,7 @@ def observe(
     from qaura.browser.auth import resolve_role
     from qaura.browser.driver import ContextSpec, Driver
     from qaura.browser.observe import build_page_model
+    from qaura.core.guardrails import guard_goto
 
     async def _run() -> None:
         storage_state = resolve_role(role) if role else None
@@ -136,7 +156,7 @@ def observe(
         async with Driver(headless=headless) as driver:
             spec = ContextSpec(persona="observe", role=role, storage_state_path=storage_state)
             async with driver.context(spec) as (context, page):
-                await page.goto(url)
+                await guard_goto(page, url, _single_url_scope(url))
                 model = await build_page_model(page)
                 console.print(model.to_prompt())
                 console.print(f"\n[dim]signature: {model.signature()}  elements: {len(model.elements)}[/dim]")
@@ -443,6 +463,9 @@ def run(
     if not target:
         console.print("[red]No target URL given.[/red] Pass --url or set target_url in qaura.yaml.")
         raise typer.Exit(code=1)
+    scoped_host = _default_scope(cfg, target)
+    if scoped_host:
+        console.print(f"[dim]No guardrails.allowed_domains configured; this run is limited to {scoped_host}.[/dim]")
 
     from qaura.browser.auth import resolve_role
 
@@ -1070,6 +1093,7 @@ def ml_genai(
 
     from qaura.browser.auth import resolve_role
     from qaura.browser.driver import ContextSpec, Driver
+    from qaura.core.guardrails import guard_goto
     from qaura.mltest.report import build_run_report, overall_gate
     from qaura.mltest.suites.genai import GenAIProbeConfig, run_genai_suite
     from qaura.reporting.html import save_html
@@ -1084,7 +1108,7 @@ def ml_genai(
         async with Driver(headless=headless) as driver:
             spec = ContextSpec(persona="genai-probe", role=role, storage_state_path=storage_state)
             async with driver.context(spec) as (_, page):
-                await page.goto(url)
+                await guard_goto(page, url, _single_url_scope(url))
                 with console.status(f"Probing GenAI feature at {url}..."):
                     return await run_genai_suite(page, config, url, refusal_probe=refusal_probe)
 

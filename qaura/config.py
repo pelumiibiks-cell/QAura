@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Literal
 
 import yaml
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field, ValidationError, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 DEFAULT_CONFIG_FILENAMES = ("qaura.yaml", "qaura.yml")
@@ -61,15 +61,22 @@ class GuardrailConfig(BaseModel):
             # Signing out discards an authenticated session and strands the rest of
             # the run on the login wall — never click it during exploration.
             "sign out", "signout", "log out", "logout", "log off",
+            "archive", "revoke", "reset password", "disable", "refund", "withdraw", "transfer",
         ]
     )
     allow_destructive: bool = False
-    max_actions_per_run: int = 500
-    max_requests_per_second: float = 5.0
-    max_wall_clock_seconds: int = 1800
-    max_llm_calls_per_run: int = 300
+    # 0 is meaningful for recon (no actions at all), so the floor is 0, not 1
+    max_actions_per_run: int = Field(500, ge=0)
+    max_requests_per_second: float = Field(5.0, ge=0)
+    max_wall_clock_seconds: int = Field(1800, ge=0)
+    max_llm_calls_per_run: int = Field(300, ge=0)
     fake_email_domain: str = "qaura.invalid"
     test_card_number: str = "4242424242424242"  # Stripe test card
+
+    @field_validator("allowed_domains")
+    @classmethod
+    def _lowercase_domains(cls, domains: list[str]) -> list[str]:
+        return [d.strip().lower() for d in domains]
 
 
 class InvariantConfig(BaseModel):

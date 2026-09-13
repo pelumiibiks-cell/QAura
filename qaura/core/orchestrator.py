@@ -219,7 +219,7 @@ class PersonaOrchestrator:
                 self.graph.mark_exercised(state_key, action.ref, element=element)
                 continue
 
-            self.limiter.throttle()
+            await self.limiter.throttle()
             description = _describe(action, element.ref, element.role, element.name)
             repro_step = ReproStep(
                 description=description, action_kind=action.kind.value, ref=action.ref,
@@ -254,7 +254,11 @@ class PersonaOrchestrator:
             # See heuristic.py's identical call for why: check_action() only validates
             # NAVIGATE actions, so a CLICK that follows an <a href> off-target is
             # otherwise never caught.
-            await enforce_scope_after_action(page, self.cfg.guardrails)
+            try:
+                await enforce_scope_after_action(page, self.cfg.guardrails)
+            except GuardrailViolation:
+                # Back didn't work; re-anchor on the target, and if that fails too run() records the stop
+                await guard_goto(page, self.target_url, self.cfg.guardrails)
 
             try:
                 new_model = await build_page_model(page)

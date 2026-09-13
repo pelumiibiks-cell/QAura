@@ -312,7 +312,7 @@ class HeuristicCrawler:
         except GuardrailViolation:
             return "blocked"
 
-        self.limiter.throttle()
+        await self.limiter.throttle()
         repro_step = ReproStep(
             description=_describe(action, element),
             action_kind=action.kind.value, ref=action.ref,
@@ -341,7 +341,11 @@ class HeuristicCrawler:
         # CLICK has no URL to check beforehand. This is what actually stops the
         # crawler from following an <a href> off-target and continuing to fuzz forms
         # there under this run's storage_state (auth cookies included).
-        await enforce_scope_after_action(page, self.cfg.guardrails)
+        try:
+            await enforce_scope_after_action(page, self.cfg.guardrails)
+        except GuardrailViolation:
+            # Back didn't work; re-anchor on the target, and if that fails too run() records the stop
+            await guard_goto(page, self.target_url, self.cfg.guardrails)
 
         try:
             new_model = await build_page_model(page)

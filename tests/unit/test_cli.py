@@ -112,3 +112,48 @@ def test_run_with_no_target_url_exits_cleanly(tmp_path, monkeypatch):
     result = runner.invoke(app, ["run", "--no-llm"])
     assert result.exit_code == 1
     assert "No target URL" in result.stdout
+
+
+def test_run_rejects_unknown_fail_on_before_crawling(tmp_path, monkeypatch):
+    import qaura.browser.driver as driver_module
+
+    async def _never(self):
+        raise AssertionError("a browser was launched before --fail-on was validated")
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(driver_module.Driver, "__aenter__", _never)
+    result = runner.invoke(app, ["run", "--url", "http://x.test/", "--no-llm", "--ci", "--fail-on", "hgih"])
+    assert result.exit_code == 2
+    assert "--fail-on" in result.stdout
+
+
+# --- helpers -----------------------------------------------------------------
+
+def test_default_scope_uses_target_host_when_unset(tmp_path, monkeypatch):
+    from qaura.cli import _default_scope
+    from qaura.config import QAuraConfig
+
+    monkeypatch.chdir(tmp_path)
+    cfg = QAuraConfig()
+    assert _default_scope(cfg, "http://Shop.test:8080/cart") == "shop.test"
+    assert cfg.guardrails.allowed_domains == ["shop.test"]
+
+
+def test_default_scope_keeps_configured_domains(tmp_path, monkeypatch):
+    from qaura.cli import _default_scope
+    from qaura.config import GuardrailConfig, QAuraConfig
+
+    monkeypatch.chdir(tmp_path)
+    cfg = QAuraConfig(guardrails=GuardrailConfig(allowed_domains=["a.test"]))
+    assert _default_scope(cfg, "http://b.test/") is None
+    assert cfg.guardrails.allowed_domains == ["a.test"]
+
+
+def test_unique_dir_appends_a_suffix_when_taken(tmp_path):
+    from qaura.cli import _unique_dir
+
+    first = _unique_dir(tmp_path / "20260913_101010")
+    first.mkdir()
+    second = _unique_dir(tmp_path / "20260913_101010")
+    assert first.name == "20260913_101010"
+    assert second.name == "20260913_101010_2"
