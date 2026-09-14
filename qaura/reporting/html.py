@@ -64,6 +64,8 @@ _TEMPLATE = r"""<!doctype html>
   .repro-not-reproduced { background: #4b5563; color: #fff; }
   .repro-na { background: #6b7280; color: #fff; }
   .occurrence-badge { background: #374151; color: #fff; }
+  .run-notes { border-left: 3px solid #b45309; padding: 4px 12px; margin-bottom: 16px; font-size: 0.9rem; }
+  .run-notes ul { margin: 4px 0; padding-left: 18px; }
   .anchor-link { color: inherit; text-decoration: none; }
   .anchor-link:hover { text-decoration: underline; }
   pre { background: #f5f5f5; padding: 8px 10px; border-radius: 6px; overflow-x: auto;
@@ -93,6 +95,12 @@ _TEMPLATE = r"""<!doctype html>
   {% if report.summary.llm_usage %} &middot; LLM calls: {{ report.summary.llm_usage.get("calls", 0) }}
     ({{ report.summary.llm_usage.get("total_tokens", 0) }} tokens){% endif %}
 </div>
+
+{% if report.summary.notes %}
+<div class="run-notes"><strong>This run ended early or partly failed:</strong>
+  <ul>{% for note in report.summary.notes %}<li>{{ note }}</li>{% endfor %}</ul>
+</div>
+{% endif %}
 
 <div class="summary-grid">
   <div class="stat"><div class="n">{{ report.findings | length }}</div><div class="l">total findings</div></div>
@@ -226,12 +234,40 @@ def _repro_display(f: Finding) -> tuple[str, str]:
     return label, css_class
 
 
-def render_html(report: RunReport) -> str:
+_IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg"}
+
+
+def _screenshot_file(path_str: str, base_dir: Path | None) -> Path | None:
+    """A finding's screenshot, but only an image file, and only from inside the run folder when one is known.
+    `qaura report` accepts any report.json, so a crafted path must not pull arbitrary local files into the HTML."""
+    path = Path(path_str)
+    if path.suffix.lower() not in _IMAGE_SUFFIXES:
+        return None
+    candidates = [path]
+    if base_dir is not None:
+        # A moved or renamed run folder still has screenshots/ next to its report
+        candidates.append(base_dir / "screenshots" / path.name)
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve()
+        except OSError:
+            continue
+        if base_dir is not None and not resolved.is_relative_to(base_dir.resolve()):
+            continue
+        if resolved.is_file():
+            return resolved
+    return None
+
+
+def render_html(report: RunReport, base_dir: str | Path | None = None) -> str:
+    base = Path(base_dir) if base_dir is not None else None
     screenshots: dict[str, str] = {}
     for f in report.findings:
-        path = f.evidence.screenshot_path
-        if path and Path(path).exists():
-            screenshots[f.id] = base64.b64encode(Path(path).read_bytes()).decode("ascii")
+        if not f.evidence.screenshot_path:
+            continue
+        shot = _screenshot_file(f.evidence.screenshot_path, base)
+        if shot is not None:
+            screenshots[f.id] = base64.b64encode(shot.read_bytes()).decode("ascii")
 
     sorted_findings = sorted(
         report.findings,
@@ -252,5 +288,5 @@ def render_html(report: RunReport) -> str:
 def save_html(report: RunReport, out_path: str | Path) -> Path:
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text(render_html(report), encoding="utf-8")
+    out_path.write_text(render_html(report, base_dir=out_path.parent), encoding="utf-8")
     return out_path

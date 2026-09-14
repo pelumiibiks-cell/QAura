@@ -9,9 +9,10 @@ Stack: Python 3.13 + Playwright + Gemini (`google-genai`, Interactions API — N
 
 ## ALL SEVEN PHASES COMPLETE. QAura is built, wired end to end, and live-verified.
 
-271 test functions (260 passing + 11 that correctly skip when the fixture server
-isn't running — see `test_replay.py`/`test_endpoint_suite.py`/`test_genai_suite.py`'s
-skip-if-not-running pattern). Every phase's deliverable was actually run against a
+652 tests as of the September 2026 hardening pass, all passing. `tests/conftest.py`
+starts the fixture server itself, so the live-server tests in `test_replay.py`,
+`test_endpoint_suite.py` and `test_genai_suite.py` run instead of skipping whenever the
+`dev` extra is installed. Every phase's deliverable was actually run against a
 real target, not just written and unit-tested in isolation — `tests/fixtures/buggy_app`
 (a deliberately buggy FastAPI + JS app) and `tests/fixtures/ml` (a deliberately
 degraded scikit-learn model + baseline) exist specifically so every detector and
@@ -994,7 +995,7 @@ assumed from the template compiling.
 ### Next action
 None required — README rewritten (reflects the actual project: what a run does,
 project layout, real command examples matching the real CLI flags). Full test suite
-green (271 total: 260 passed, 11 correctly skipped without a live fixture server).
+green (652 passed as of the 2026-09-13 hardening pass).
 All seven phases of the original plan are complete and live-verified. Genuinely
 optional next steps if this project continues: enable Gemini billing (or point
 `qaura.yaml`'s `model_tiers` at Flash models) to use Pro-tier quality for real; a
@@ -1014,6 +1015,54 @@ the tool today.
 - Nothing else outstanding. Every other open item from earlier in this file was
   either fixed (see the many "Fixes applied" / "found and fixed" entries throughout)
   or is a deliberate, documented scope decision, not a gap someone forgot about.
+
+### Hardening pass (2026-09-13)
+
+A review of the codebase after `qaura init` landed. All on branch `fix/hardening`, one
+commit per area, each with its own tests.
+
+- **Crash safety.** Any unexpected exception inside a crawl used to propagate out of
+  `asyncio.run(_run())` before `report.json` was first written, losing every finding.
+  Both crawlers now catch it in `run()`, keep what they found and record
+  `aborted_reason`, which surfaces as `RunSummary.notes` in the report. Page-model
+  builds go through `observe.try_build_page_model` (one retry). Failed actions count
+  against the action cap. One failing persona no longer ends the others.
+- **Invariants.** Runtime errors (division by zero, list vs number) are inconclusive
+  instead of crashing the crawl. `[0] * n` repetition is rejected. `load_config`
+  validates every expression up front, and `qaura init` validates candidates
+  structurally instead of plugging 1.0 into every value, which rejected valid rules
+  like `a / (b - c)`.
+- **Guardrails.** An empty `allowed_domains` meant every domain; `qaura run` now pins
+  it to the target host. `enforce_scope_after_action` raises when it can't step back,
+  and callers re-anchor on the target or stop. Enter in a form field inherits the
+  form's destructive buttons. Scope matching ignores case and percent-encoding.
+  `RunLimiter.throttle` awaits instead of `time.sleep`.
+- **Auth.** `--role` is validated before it becomes a file name; session files are
+  written owner-only.
+- **Config.** yaml passed as init kwargs outranked env vars in pydantic-settings, the
+  opposite of the documented order. `load_config` now re-applies env-set fields on top.
+  Nested sections forbid unknown keys; unknown top-level keys log a warning.
+- **LLM layer.** Retries re-resolve the model per attempt, so a retry after a quota
+  fallback no longer goes back to the blocked model. 400/401/403/404 aren't retried.
+  Schema mismatches raise `LLMParseError` carrying usage, so failed parses still count
+  against the budget. Persona LLM calls run via `asyncio.to_thread`. Planner and triage
+  schema fields are `Literal`s.
+- **Init read-only gaps.** Service workers are blocked in recon/check contexts
+  (`context.route` never sees their traffic). `/logout.php`, `/delete-account` and
+  `?action=delete` are caught. Beacons can't spend the login exemption. Sitemaps
+  declared in robots.txt are scope-checked and size-capped. Assisted login clears the
+  seen set so walled pages get re-crawled.
+- **Analysis and reporting.** Dedupe keeps the most severe member, doesn't mutate
+  input, sums counts, and leaves digits inside quoted names alone. Repro scripts are
+  only emitted for `REPLAYABLE_DETECTORS` and replay under the run's session. The HTML
+  report only embeds image files from inside its own run folder.
+- **Tooling.** `ruff check` (E9, F, B) in CI plus a Windows test job. The overnight
+  `QAura-Resume-0600` scheduled task was removed: it had failed daily since 2026-08-31
+  because Windows PowerShell 5.1's `ProcessStartInfo` has no `ArgumentList`.
+
+Deliberately not done in this pass: splitting `cli.py`, a shared base for
+`heuristic.py`/`orchestrator.py`, one shared destructive-keyword list, faster
+`build_page_model`, type hints across the package, and form-aware persona crawling.
 
 ### Fixes applied 2026-08-30 (user said "fix all and continue")
 

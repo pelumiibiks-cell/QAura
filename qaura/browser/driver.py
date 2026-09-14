@@ -24,6 +24,8 @@ class ContextSpec:
     role: str | None = None
     storage_state_path: str | None = None
     viewport: tuple[int, int] = (1280, 800)
+    # context.route() never sees service-worker traffic, so read-only contexts block workers outright
+    block_service_workers: bool = False
 
 
 class Driver:
@@ -42,14 +44,22 @@ class Driver:
 
     async def __aenter__(self) -> "Driver":
         self._playwright = await async_playwright().start()
-        self._browser = await self._playwright.chromium.launch(headless=self._headless)
+        try:
+            self._browser = await self._playwright.chromium.launch(headless=self._headless)
+        except BaseException:
+            # __aexit__ never runs when __aenter__ raises, so stop Playwright here
+            await self._playwright.stop()
+            self._playwright = None
+            raise
         return self
 
     async def __aexit__(self, exc_type, exc, tb) -> None:
-        if self._browser is not None:
-            await self._browser.close()
-        if self._playwright is not None:
-            await self._playwright.stop()
+        try:
+            if self._browser is not None:
+                await self._browser.close()
+        finally:
+            if self._playwright is not None:
+                await self._playwright.stop()
 
     @asynccontextmanager
     async def context(self, spec: ContextSpec) -> AsyncIterator[tuple[BrowserContext, Page]]:
@@ -59,6 +69,8 @@ class Driver:
         kwargs: dict = {"viewport": {"width": spec.viewport[0], "height": spec.viewport[1]}}
         if spec.storage_state_path and Path(spec.storage_state_path).exists():
             kwargs["storage_state"] = spec.storage_state_path
+        if spec.block_service_workers:
+            kwargs["service_workers"] = "block"
 
         context = await self._browser.new_context(**kwargs)
         try:

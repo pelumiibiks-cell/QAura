@@ -1,4 +1,6 @@
-from qaura.reporting.html import render_html
+import base64
+
+from qaura.reporting.html import render_html, save_html
 from qaura.reporting.models import Evidence, Finding, ReproStep, RunReport, RunSummary, Severity
 
 
@@ -84,3 +86,41 @@ def test_render_html_escapes_untrusted_content():
     html = render_html(_report([finding]))
     assert "<script>alert(1)</script>" not in html
     assert "&lt;script&gt;" in html
+
+
+def _b64(path) -> str:
+    return base64.b64encode(path.read_bytes()).decode("ascii")
+
+
+def test_render_html_embeds_only_screenshots_inside_the_run_dir(tmp_path):
+    run_dir = tmp_path / "run"
+    inside = run_dir / "screenshots" / "0001.png"
+    inside.parent.mkdir(parents=True)
+    inside.write_bytes(b"inside-image-bytes")
+    outside = tmp_path / "secret.png"
+    outside.write_bytes(b"outside-secret-bytes")
+
+    findings = [
+        Finding(title="in", evidence=Evidence(screenshot_path=str(inside))),
+        Finding(title="out", evidence=Evidence(screenshot_path=str(run_dir / ".." / "secret.png"))),
+    ]
+    html = render_html(_report(findings), base_dir=run_dir)
+    assert _b64(inside) in html
+    assert _b64(outside) not in html
+
+
+def test_render_html_never_embeds_non_image_files(tmp_path):
+    notes = tmp_path / "notes.txt"
+    notes.write_text("private notes", encoding="utf-8")
+    finding = Finding(title="x", evidence=Evidence(screenshot_path=str(notes)))
+    assert _b64(notes) not in render_html(_report([finding]), base_dir=tmp_path)
+
+
+def test_save_html_finds_screenshots_after_the_run_dir_moves(tmp_path):
+    run_dir = tmp_path / "moved_run"
+    shot = run_dir / "screenshots" / "0001.png"
+    shot.parent.mkdir(parents=True)
+    shot.write_bytes(b"moved-image-bytes")
+    finding = Finding(title="x", evidence=Evidence(screenshot_path="runs/20260101_000000/screenshots/0001.png"))
+    out = save_html(_report([finding]), run_dir / "report.html")
+    assert _b64(shot) in out.read_text(encoding="utf-8")

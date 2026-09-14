@@ -32,12 +32,18 @@ qaura observe http://localhost:8000/dashboard --role user
 
 If this prints the actual dashboard (nav links, page content) rather than a login form, the session is good.
 
-**4. Point `qaura.yaml` at the app** (copy from `qaura.example.yaml` if you don't have one yet):
+**4. Point `qaura.yaml` at the app.** The quickest way is to let QAura propose one through the session you just captured, then review it:
+
+```
+qaura init --url http://localhost:8000/dashboard --role user
+```
+
+That writes `qaura.generated.yaml` (read-only crawl, nothing submitted). Or write it by hand, copying from `qaura.example.yaml`:
 
 ```yaml
 target_url: "http://localhost:8000/dashboard"
 guardrails:
-  allowed_domains: ["localhost", "127.0.0.1"]   # default is only "localhost" — widen this or the run gets scope-blocked
+  allowed_domains: ["localhost", "127.0.0.1"]   # if unset, a run is limited to the --url host; list every host the app redirects between
 auth_roles:
   - name: user
     storage_state_path: ".qaura/auth/user.json"

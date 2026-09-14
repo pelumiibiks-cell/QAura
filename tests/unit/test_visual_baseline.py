@@ -1,5 +1,6 @@
 from pathlib import Path
 
+import pytest
 from PIL import Image
 
 from qaura.analysis.visual_baseline import (
@@ -41,7 +42,7 @@ def _make_complex_png(path: Path, seed: int, size=(300, 400)) -> None:
     img = Image.new("RGB", size, (255, 255, 255))
     draw = ImageDraw.Draw(img)
     rng = seed
-    for i in range(20):
+    for _ in range(20):
         rng = (rng * 1103515245 + 12345) & 0x7FFFFFFF
         x0, y0 = rng % size[0], (rng // size[0]) % size[1]
         x1, y1 = min(x0 + 30, size[0]), min(y0 + 20, size[1])
@@ -95,11 +96,8 @@ def test_compare_screenshots_tolerates_tiny_noise(tmp_path):
 def test_compare_screenshots_raises_for_missing_file(tmp_path):
     a = tmp_path / "a.png"
     _make_png(a, (255, 0, 0))
-    try:
+    with pytest.raises(BaselineCompareError):
         compare_screenshots(str(a), str(tmp_path / "nonexistent.png"))
-        assert False, "expected BaselineCompareError"
-    except BaselineCompareError:
-        pass
 
 
 def _finding(title: str, detector: str, screenshot_path: str | None, url: str = "http://x/") -> Finding:

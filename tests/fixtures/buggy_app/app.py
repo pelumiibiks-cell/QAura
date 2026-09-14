@@ -46,7 +46,7 @@ any input back unprompted including PII-shaped input.
 from __future__ import annotations
 
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 import uvicorn
 
 app = FastAPI()
@@ -253,6 +253,67 @@ async def validate_email(request: Request) -> JSONResponse:
 
 
 # BUG: no /api/subscribe route at all -- every call 404s.
+
+
+# --- auth routes, for `qaura init`'s login-wall detection -----------------------------
+# Deliberately NOT linked from PAGE. Every existing crawl-based test (test_heuristic,
+# test_replay, test_orchestrator) asserts against what is reachable from "/", so linking
+# these would change those results for reasons unrelated to what they test. Recon tests
+# navigate to them directly.
+
+_LOGIN_PAGE = """<!doctype html>
+<html><head><title>Sign in</title></head><body>
+<h1>Sign in</h1>
+<form method="post" action="/login">
+  <label>Username <input type="text" name="username" id="username"></label>
+  <label>Password <input type="password" name="password" id="password"></label>
+  <button type="submit">Log in</button>
+</form>
+</body></html>
+"""
+
+_PRIVATE_PAGE = """<!doctype html>
+<html><head><title>Private</title></head><body>
+<h1>Admin dashboard</h1>
+<div data-testid="stats">
+  <div>Users: <span data-testid="user-count">42</span></div>
+  <div>Active: <span data-testid="active-count">40</span></div>
+  <div>Inactive: <span data-testid="inactive-count">2</span></div>
+</div>
+</body></html>
+"""
+
+_SESSION_COOKIE = "qaura_fixture_session"
+
+
+@app.get("/login", response_class=HTMLResponse)
+async def login_page() -> str:
+    return _LOGIN_PAGE
+
+
+@app.post("/login")
+async def login_submit(request: Request):
+    # Parsed by hand rather than via request.form(), which needs python-multipart —
+    # an extra dependency the test extras don't carry, and whose absence surfaces as a
+    # 500 rather than an import error.
+    from urllib.parse import parse_qs
+
+    raw = (await request.body()).decode("utf-8", "replace")
+    fields = parse_qs(raw)
+    username = (fields.get("username") or [""])[0]
+    password = (fields.get("password") or [""])[0]
+    if username == "demo" and password == "demo-password":
+        response = RedirectResponse(url="/private", status_code=303)
+        response.set_cookie(_SESSION_COOKIE, "ok")
+        return response
+    return HTMLResponse(_LOGIN_PAGE.replace("<h1>Sign in</h1>", "<h1>Sign in</h1><p>Bad credentials</p>"), status_code=401)
+
+
+@app.get("/private", response_class=HTMLResponse)
+async def private_page(request: Request):
+    if request.cookies.get(_SESSION_COOKIE) != "ok":
+        return HTMLResponse("<html><body><h1>401</h1><p>Unauthorized</p></body></html>", status_code=401)
+    return HTMLResponse(_PRIVATE_PAGE)
 
 
 def main() -> None:

@@ -45,6 +45,8 @@ kept as a permanent regression guard) or copy what you need into a hand-maintain
 
 See FINDING.title / FINDING.description below for the actual bug details.
 """
+from pathlib import Path
+
 import pytest
 
 from qaura.analysis.replay import replay_finding
@@ -67,13 +69,18 @@ FINDING = Finding(
 {invariants_literal}
 ]
 
+# Session the original run used; replaying a logged-in bug anonymously would never reproduce it
+STORAGE_STATE = {storage_state!r}
+
 
 @pytest.mark.asyncio
 async def test_repro_{safe_id}():
     """Fails while the bug still reproduces; passes once it's fixed."""
+    if STORAGE_STATE and not Path(STORAGE_STATE).exists():
+        pytest.skip(f"session file {{STORAGE_STATE}} is missing; recapture it with qaura auth capture")
     async with Driver(headless=True) as driver:
         cfg = QAuraConfig(invariants=INVARIANTS)
-        result = await replay_finding(driver, cfg, FINDING, attempts=1)
+        result = await replay_finding(driver, cfg, FINDING, attempts=1, storage_state_path=STORAGE_STATE)
     assert result.successes == 0, (
         f"Bug still reproduces: {{FINDING.title}} ({{result.rate_str}})"
     )
@@ -114,7 +121,9 @@ def _invariant_literal(inv: InvariantConfig) -> str:
     )
 
 
-def render_repro_script(finding: Finding, invariants: list[InvariantConfig] | None = None) -> str:
+def render_repro_script(
+    finding: Finding, invariants: list[InvariantConfig] | None = None, storage_state_path: str | None = None,
+) -> str:
     invariants = invariants or []
     matched = _find_invariant_for(finding, invariants)
 
@@ -136,17 +145,25 @@ def render_repro_script(finding: Finding, invariants: list[InvariantConfig] | No
         url=finding.url, description=finding.description,
         repro_steps_literal=repro_steps_literal or "        # (no repro steps captured)",
         invariants_comment=comment, invariants_literal=invariants_literal, safe_id=safe_id,
+        storage_state=storage_state_path,
     )
 
 
-def emit_repro_script(finding: Finding, out_dir: str | Path, invariants: list[InvariantConfig] | None = None) -> Path | None:
-    """Returns the written path, or None if the finding has no repro_steps to emit
-    (nothing useful to generate — the caller should not treat this as an error)."""
-    if not finding.repro_steps:
+def emit_repro_script(
+    finding: Finding, out_dir: str | Path, invariants: list[InvariantConfig] | None = None,
+    storage_state_path: str | None = None,
+) -> Path | None:
+    """Returns the written path, or None when there's nothing useful to generate: no
+    repro_steps, or a detector replay can't re-check (a `flow` script would always pass,
+    since replay never re-runs that detector). Not an error for the caller."""
+    # Deferred: replay pulls in Playwright and every detector
+    from qaura.analysis.replay import REPLAYABLE_DETECTORS
+
+    if not finding.repro_steps or finding.detector not in REPLAYABLE_DETECTORS:
         return None
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     safe_id = _safe_id(finding.id)
     path = out_dir / f"test_repro_{safe_id}.py"
-    path.write_text(render_repro_script(finding, invariants), encoding="utf-8")
+    path.write_text(render_repro_script(finding, invariants, storage_state_path), encoding="utf-8")
     return path

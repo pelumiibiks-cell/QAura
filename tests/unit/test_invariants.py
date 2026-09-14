@@ -2,7 +2,7 @@ import pytest
 from playwright.async_api import async_playwright
 
 from qaura.config import InvariantConfig
-from qaura.core.invariants import InvariantError, check, evaluate_expression, parse_number
+from qaura.core.invariants import InvariantError, check, evaluate_expression, parse_number, validate_invariant
 
 
 # --- parse_number --------------------------------------------------------------
@@ -213,3 +213,44 @@ async def test_check_returns_none_when_container_not_present():
         finding = await check(pg, invariant, pg.url, [], "heuristic")
         assert finding is None  # inconclusive, not a violation
         await browser.close()
+
+
+# --- runtime errors and load-time validation -------------------------------------
+
+def test_evaluate_expression_division_by_zero_raises_invariant_error():
+    with pytest.raises(InvariantError, match="could not be evaluated"):
+        evaluate_expression("total / count > 1", {"total": 1.0, "count": 0.0})
+
+
+def test_evaluate_expression_list_compared_to_number_raises_invariant_error():
+    with pytest.raises(InvariantError, match="could not be evaluated"):
+        evaluate_expression("line_items > 0", {"line_items": [1.0, 2.0]})
+
+
+@pytest.mark.parametrize("expression", ["len([0] * 1000000000) > 0", "len(1000000000 * [0]) > 0", "len((0,) * 99) > 0"])
+def test_evaluate_expression_rejects_sequence_repetition(expression):
+    with pytest.raises(InvariantError, match="repetition"):
+        evaluate_expression(expression, {})
+
+
+def test_validate_invariant_accepts_known_names():
+    validate_invariant(InvariantConfig(name="n", description="d", values={"a": "#a"}, expression="a > 0"))
+
+
+def test_validate_invariant_rejects_unknown_name():
+    with pytest.raises(InvariantError, match="unknown name"):
+        validate_invariant(InvariantConfig(name="n", description="d", values={"a": "#a"}, expression="b > 0"))
+
+
+def test_validate_invariant_rejects_bad_syntax():
+    with pytest.raises(InvariantError, match="syntax"):
+        validate_invariant(InvariantConfig(name="n", description="d", values={"a": "#a"}, expression="a >"))
+
+
+async def test_check_is_inconclusive_when_expression_divides_by_zero(page):
+    await page.set_content('<span id="t">$10</span><span id="c">0</span>')
+    invariant = InvariantConfig(
+        name="average_above_one", description="d",
+        values={"t": "#t", "c": "#c"}, expression="t / c > 1",
+    )
+    assert await check(page, invariant, page.url, [], "heuristic") is None

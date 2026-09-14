@@ -21,15 +21,21 @@ class _FakePage:
     `goto`/`go_back`) for guard_goto/enforce_scope_after_action, without needing a
     real browser for what's really just URL-comparison logic."""
 
-    def __init__(self, url: str) -> None:
+    def __init__(self, url: str, back_url: str | None = None, back_raises: bool = False) -> None:
         self.url = url
         self.went_back = False
+        self._back_url = back_url
+        self._back_raises = back_raises
 
     async def goto(self, url: str) -> None:
         self.url = url
 
     async def go_back(self) -> None:
         self.went_back = True
+        if self._back_raises:
+            raise RuntimeError("no history to go back to")
+        if self._back_url is not None:
+            self.url = self._back_url
 
 
 def _cfg(**overrides) -> GuardrailConfig:
@@ -225,7 +231,7 @@ async def test_enforce_scope_after_action_steps_back_on_drift():
     # follow it and keep fuzzing forms on the external site under this run's auth
     # cookies. This is the post-hoc catch for exactly that.
     cfg = _cfg(allowed_domains=["shop.test"])
-    page = _FakePage(url="http://evil.test/phish")
+    page = _FakePage(url="http://evil.test/phish", back_url="http://shop.test/")
     stepped_back = await enforce_scope_after_action(page, cfg)
     assert stepped_back is True
     assert page.went_back is True
@@ -238,3 +244,68 @@ async def test_enforce_scope_after_action_noop_when_in_scope():
     stepped_back = await enforce_scope_after_action(page, cfg)
     assert stepped_back is False
     assert page.went_back is False
+
+
+@pytest.mark.asyncio
+async def test_enforce_scope_after_action_raises_when_back_fails():
+    cfg = _cfg(allowed_domains=["shop.test"])
+    page = _FakePage(url="http://evil.test/phish", back_raises=True)
+    with pytest.raises(GuardrailViolation, match="could not step back"):
+        await enforce_scope_after_action(page, cfg)
+
+
+@pytest.mark.asyncio
+async def test_enforce_scope_after_action_raises_when_back_is_still_out_of_scope():
+    cfg = _cfg(allowed_domains=["shop.test"])
+    page = _FakePage(url="http://evil.test/b", back_url="http://evil.test/a")
+    with pytest.raises(GuardrailViolation):
+        await enforce_scope_after_action(page, cfg)
+
+
+def _form_model(button_name: str) -> PageModel:
+    return PageModel(url="http://shop.test/account", title="t", elements=[
+        ElementInfo(ref="e1", role="textbox", name="Confirmation", form_key="f1"),
+        ElementInfo(ref="e2", role="button", name=button_name, form_key="f1"),
+    ])
+
+
+def test_enter_in_a_destructive_form_is_blocked():
+    # Regression: only the focused field's name was checked, so Enter submitted "Delete account" forms
+    with pytest.raises(GuardrailViolation):
+        check_action(Action(kind=ActionKind.KEY, ref="e1", value="Enter"), _form_model("Delete account"), _cfg())
+
+
+def test_enter_in_a_harmless_form_is_allowed():
+    check_action(Action(kind=ActionKind.KEY, ref="e1", value="Enter"), _form_model("Search"), _cfg())
+
+
+def test_tab_in_a_destructive_form_is_allowed():
+    check_action(Action(kind=ActionKind.KEY, ref="e1", value="Tab"), _form_model("Delete account"), _cfg())
+
+
+@pytest.mark.parametrize("name", [
+    "Archive project", "Revoke token", "Refund payment", "Withdraw funds",
+    "Transfer ownership", "Disable two-factor", "Reset password",
+])
+def test_new_destructive_patterns_are_blocked_by_default(name):
+    assert is_destructive(ElementInfo(ref="e1", role="button", name=name), _cfg())
+
+
+def test_in_scope_domain_match_ignores_case():
+    cfg = _cfg(allowed_domains=["Shop.Test"])
+    assert is_in_scope("http://SHOP.test/cart", cfg) is True
+
+
+def test_blocked_path_matches_percent_encoded_and_uppercase_paths():
+    cfg = _cfg(allowed_domains=["shop.test"], blocked_paths=["/logout*"])
+    assert is_in_scope("http://shop.test/log%6Fut", cfg) is False
+    assert is_in_scope("http://shop.test/LOGOUT", cfg) is False
+    assert is_in_scope("http://shop.test/login", cfg) is True
+
+
+@pytest.mark.asyncio
+async def test_throttle_awaits_between_actions():
+    limiter = RunLimiter(cfg=_cfg(max_requests_per_second=20.0))
+    assert await limiter.throttle() == 0.0
+    slept = await limiter.throttle()
+    assert 0 < slept <= 0.05

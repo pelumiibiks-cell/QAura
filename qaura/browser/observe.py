@@ -221,6 +221,21 @@ class PageModel:
 CHECKABLE_ROLES = {"checkbox", "radio", "switch", "menuitemcheckbox", "menuitemradio"}
 
 
+async def try_build_page_model(page: Page, retries: int = 1) -> PageModel | None:
+    """build_page_model retried after the page settles; None if it still fails (a navigation mid-snapshot is routine)."""
+    for attempt in range(retries + 1):
+        try:
+            return await build_page_model(page)
+        except Exception:
+            _log.debug("page model build failed (attempt %d)", attempt + 1, exc_info=True)
+            if attempt < retries:
+                try:
+                    await page.wait_for_load_state("domcontentloaded", timeout=5000)
+                except Exception:
+                    pass
+    return None
+
+
 async def build_page_model(page: Page) -> PageModel:
     """`page.aria_snapshot()` gives us role/name/value/checked/disabled for the whole
     tree in one call (parsed via parse_aria_snapshot above); we still need a live

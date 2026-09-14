@@ -85,11 +85,8 @@ def test_complete_remembers_downgrade_for_subsequent_calls():
 def test_complete_raises_when_fallback_model_itself_is_quota_blocked():
     tiers = ModelTiers()
     provider, client = _provider_with_fake_client(fail_models={tiers.planner, tiers.element_classify})
-    try:
+    with pytest.raises(RateLimitError):
         provider.complete(tier=Tier.PLANNER, system="s", input="hello")
-        assert False, "expected RateLimitError to propagate"
-    except RateLimitError:
-        pass
 
 
 def test_complete_retries_transient_errors_then_succeeds():
@@ -147,9 +144,81 @@ def test_complete_does_not_downgrade_on_non_quota_errors():
     fake_client.interactions = _FakeInteractionsAPIRaisingValueError()
     provider._client = fake_client
 
-    try:
+    with pytest.raises(ValueError):
         provider.complete(tier=Tier.PLANNER, system="s", input="hello")
-        assert False, "expected ValueError to propagate untouched"
-    except ValueError:
-        pass
     assert Tier.PLANNER not in provider._quota_downgraded
+
+
+def test_retry_after_quota_fallback_stays_on_the_fallback_model():
+    # Regression: the retry loop passed the original model on every attempt, so a
+    # transient error on the fallback call sent the retry back to the quota-blocked model
+    tiers = ModelTiers()
+
+    class _BlockedThenFlaky:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+            self.fallback_failures = 1
+
+        def create(self, *, model, **kwargs):
+            self.calls.append(model)
+            if model == tiers.planner:
+                raise _fake_rate_limit_error()
+            if self.fallback_failures:
+                self.fallback_failures -= 1
+                raise ConnectionError("transient blip on the fallback call")
+            return _FakeInteraction(model)
+
+    provider = GeminiProvider(api_key="fake-key", model_tiers=tiers)
+    fake_client = _FakeClient(fail_models=set())
+    api = _BlockedThenFlaky()
+    fake_client.interactions = api
+    provider._client = fake_client
+
+    response = provider.complete(tier=Tier.PLANNER, system="s", input="hello")
+    assert tiers.element_classify in response.text
+    assert api.calls == [tiers.planner, tiers.element_classify, tiers.element_classify]
+
+
+@pytest.mark.parametrize("status", [400, 401, 403, 404])
+def test_client_errors_are_not_retried(status):
+    class _ClientError(Exception):
+        status_code = status
+
+    class _AlwaysClientError:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def create(self, *, model, **kwargs):
+            self.calls += 1
+            raise _ClientError(f"HTTP {status}")
+
+    provider = GeminiProvider(api_key="fake-key", model_tiers=ModelTiers())
+    fake_client = _FakeClient(fail_models=set())
+    api = _AlwaysClientError()
+    fake_client.interactions = api
+    provider._client = fake_client
+
+    with pytest.raises(_ClientError):
+        provider.complete(tier=Tier.PLANNER, system="s", input="hello")
+    assert api.calls == 1
+
+
+def test_malformed_structured_output_raises_parse_error_carrying_usage():
+    from qaura.llm.base import LLMParseError
+    from qaura.llm.schemas import PlannerResponse
+
+    class _NotJson:
+        def create(self, *, model, **kwargs):
+            interaction = _FakeInteraction(model)
+            interaction.output_text = "definitely not json"
+            return interaction
+
+    provider = GeminiProvider(api_key="fake-key", model_tiers=ModelTiers())
+    fake_client = _FakeClient(fail_models=set())
+    fake_client.interactions = _NotJson()
+    provider._client = fake_client
+
+    with pytest.raises(LLMParseError) as exc_info:
+        provider.complete(tier=Tier.PLANNER, system="s", input="hello", schema=PlannerResponse)
+    assert exc_info.value.usage is not None
+    assert exc_info.value.text == "definitely not json"

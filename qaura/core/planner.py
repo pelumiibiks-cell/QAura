@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from qaura.browser.actions import Action, ActionKind
 from qaura.browser.observe import PageModel
-from qaura.llm.base import LLMProvider, Tier
+from qaura.llm.base import LLMParseError, LLMProvider, Tier
 from qaura.llm.budget import Budget
 from qaura.llm.schemas import PlannedAction, PlannerResponse
 
@@ -55,13 +55,18 @@ def plan_next_action(
     if not provider.available:
         raise PlannerError("plan_next_action called with an unavailable LLMProvider")
 
-    response = provider.complete(
-        tier=Tier.PLANNER,
-        system=persona_system_prompt,
-        input=build_prompt(page_model, exercised_refs),
-        schema=PlannerResponse,
-        session=session,
-    )
+    try:
+        response = provider.complete(
+            tier=Tier.PLANNER,
+            system=persona_system_prompt,
+            input=build_prompt(page_model, exercised_refs),
+            schema=PlannerResponse,
+            session=session,
+        )
+    except LLMParseError as e:
+        if budget is not None:
+            budget.record(Tier.PLANNER, e.as_response())
+        raise PlannerError(f"planner returned no parsable structured output: {e.text!r}") from e
     if budget is not None:
         budget.record(Tier.PLANNER, response)
 

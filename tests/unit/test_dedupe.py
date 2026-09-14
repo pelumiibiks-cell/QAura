@@ -69,3 +69,32 @@ def test_dedupe_empty_list():
     assert result.findings == []
     assert result.total_before == 0
     assert result.total_after == 0
+
+
+def test_dedupe_keeps_most_severe_representative():
+    low = Finding(title="Uncaught page error", detector="crash", url="http://shop.test/", severity=Severity.LOW)
+    high = Finding(title="Uncaught page error", detector="crash", url="http://shop.test/", severity=Severity.HIGH)
+    result = dedupe([low, high])
+    assert result.total_after == 1
+    assert result.findings[0].severity == Severity.HIGH
+    assert result.findings[0].occurrence_count == 2
+
+
+def test_dedupe_does_not_mutate_its_input():
+    a = _finding("Invariant violated: x")
+    b = _finding("Invariant violated: x")
+    dedupe([a, b])
+    assert a.occurrence_count == 1
+    assert b.occurrence_count == 1
+
+
+def test_dedupe_counts_survive_a_second_pass():
+    first = dedupe([_finding("Invariant violated: x") for _ in range(3)]).findings
+    again = dedupe(first + [_finding("Invariant violated: x")])
+    assert again.findings[0].occurrence_count == 4
+
+
+def test_normalize_title_keeps_digits_inside_quotes():
+    a = normalize_title('button ("Item 2") has no accessible name')
+    b = normalize_title('button ("Item 3") has no accessible name')
+    assert a != b

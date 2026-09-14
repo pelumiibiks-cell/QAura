@@ -9,17 +9,19 @@ means something.
 """
 from __future__ import annotations
 
+import asyncio
 import fnmatch
 import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
-from playwright.async_api import Page
+from playwright.async_api import Page, Response
 
 from qaura.browser.actions import Action, ActionKind
 from qaura.browser.observe import ElementInfo, PageModel
 from qaura.config import GuardrailConfig
+from qaura.core.forms import group_forms
 
 if TYPE_CHECKING:
     # Deferred to avoid a runtime import cycle (personas -> ... -> guardrails isn't
@@ -55,15 +57,17 @@ class RunLimiter:
 
     def check_before_action(self) -> None:
         elapsed = time.monotonic() - self._start_time
-        if elapsed > self.cfg.max_wall_clock_seconds:
-            raise BudgetStop(f"wall clock cap hit: {elapsed:.0f}s > {self.cfg.max_wall_clock_seconds}s")
+        # >= so a 0s cap always stops: Windows' ~15ms clock can report 0.0 elapsed right after start
+        if elapsed >= self.cfg.max_wall_clock_seconds:
+            raise BudgetStop(f"wall clock cap hit: {elapsed:.0f}s of {self.cfg.max_wall_clock_seconds}s")
         if self.actions_taken >= self.cfg.max_actions_per_run:
             raise BudgetStop(f"action cap hit: {self.actions_taken} >= {self.cfg.max_actions_per_run}")
 
-    def throttle(self) -> float:
+    async def throttle(self) -> float:
         """Sleeps just long enough to respect max_requests_per_second, if needed.
         Returns the number of seconds actually slept, so a caller/test can assert on
-        it without needing to wall-clock the whole call."""
+        it without needing to wall-clock the whole call. Awaits rather than blocking
+        the event loop."""
         if self.cfg.max_requests_per_second <= 0:
             return 0.0
         min_interval = 1.0 / self.cfg.max_requests_per_second
@@ -72,7 +76,7 @@ class RunLimiter:
         if self._last_action_time is not None:
             wait = min_interval - (now - self._last_action_time)
             if wait > 0:
-                time.sleep(wait)
+                await asyncio.sleep(wait)
                 slept = wait
         self._last_action_time = time.monotonic()
         return slept
@@ -87,28 +91,34 @@ def is_in_scope(url: str, cfg: GuardrailConfig) -> bool:
     # (which is "host:port" — comparing that against allowed_domains like "localhost"
     # never matches once a port is present, silently defeating this whole check).
     host = parts.hostname
-    if cfg.allowed_domains and not (
-        host is not None and any(host == d or host.endswith(f".{d}") for d in cfg.allowed_domains)
-    ):
+    domains = [d.lower() for d in cfg.allowed_domains]
+    if domains and not (host is not None and any(host == d or host.endswith(f".{d}") for d in domains)):
         return False
-    path = parts.path or "/"
-    if cfg.blocked_paths and any(fnmatch.fnmatch(path, pat) for pat in cfg.blocked_paths):
+    # Decoded and lowercased so /log%6Fut and /LOGOUT match the same patterns on every OS
+    path = unquote(parts.path or "/").lower()
+    if cfg.blocked_paths and any(fnmatch.fnmatchcase(path, pat.lower()) for pat in cfg.blocked_paths):
         return False
-    if cfg.allowed_paths and not any(fnmatch.fnmatch(path, pat) for pat in cfg.allowed_paths):
+    if cfg.allowed_paths and not any(fnmatch.fnmatchcase(path, pat.lower()) for pat in cfg.allowed_paths):
         return False
     return True
 
 
-async def guard_goto(page: Page, url: str, cfg: GuardrailConfig) -> None:
+async def guard_goto(page: Page, url: str, cfg: GuardrailConfig) -> Response | None:
     """The single choke point every navigation (crawl start, frontier jump, form
     re-anchor, cross-role probe, replay) must go through. Without this, `is_in_scope`
     is only reachable via ActionKind.NAVIGATE, which nothing in the codebase ever
     emits — every real navigation called page.goto() directly, so allowed_domains
     never actually constrained anything despite the module-level claim that "every
-    action is checked here first"."""
+    action is checked here first".
+
+    Returns Playwright's Response so a caller can read the HTTP status — `qaura init`'s
+    recon needs it to tell a 401/403 wall from a normal page, which is not recoverable
+    from the DOM alone. Playwright returns None for a same-document navigation (a
+    fragment change), so the type is Optional. Every pre-existing caller ignores the
+    return value."""
     if not is_in_scope(url, cfg):
         raise GuardrailViolation(f"navigation target out of scope: {url}")
-    await page.goto(url)
+    return await page.goto(url)
 
 
 async def enforce_scope_after_action(page: Page, cfg: GuardrailConfig) -> bool:
@@ -117,13 +127,16 @@ async def enforce_scope_after_action(page: Page, cfg: GuardrailConfig) -> bool:
     it has no URL to validate before the fact — so this is what actually stops the
     crawler from following a link off-target and continuing to fuzz forms there under
     whatever storage_state (auth cookies) the run was given. Returns True if it had to
-    step back."""
+    step back, and raises GuardrailViolation if stepping back didn't return the page to
+    scope, so the caller can re-anchor or stop instead of acting on the foreign page."""
     if is_in_scope(page.url, cfg):
         return False
     try:
         await page.go_back()
     except Exception:
         pass
+    if not is_in_scope(page.url, cfg):
+        raise GuardrailViolation(f"left scope and could not step back: {page.url}")
     return True
 
 
@@ -135,6 +148,14 @@ def is_destructive(element: ElementInfo, cfg: GuardrailConfig) -> bool:
     the worse failure mode."""
     name_lower = (element.name or "").lower()
     return any(pattern.lower() in name_lower for pattern in cfg.destructive_patterns)
+
+
+def _submits_destructive_form(action: Action, element: ElementInfo, page_model: PageModel, cfg: GuardrailConfig) -> bool:
+    """Enter in a form field submits the form, so it inherits the form's destructive buttons."""
+    if action.kind != ActionKind.KEY or str(action.value or "").lower() != "enter" or not element.form_key:
+        return False
+    form = next((g for g in group_forms(page_model) if g.key == element.form_key), None)
+    return form is not None and any(is_destructive(button, cfg) for button in form.buttons)
 
 
 def check_action(
@@ -164,7 +185,7 @@ def check_action(
     if element is None:
         raise GuardrailViolation(f"ref {action.ref!r} not found in current PageModel", action)
 
-    if is_destructive(element, cfg):
+    if is_destructive(element, cfg) or _submits_destructive_form(action, element, page_model, cfg):
         persona_allows = persona is None or persona.attempts_destructive
         if not cfg.allow_destructive:
             raise GuardrailViolation(

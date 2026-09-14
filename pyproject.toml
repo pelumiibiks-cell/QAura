@@ -49,6 +49,7 @@ dev = [
     "pytest-asyncio>=0.24,<1",
     "fastapi>=0.115",
     "uvicorn>=0.32",
+    "ruff>=0.6",
 ]
 
 [project.urls]
@@ -70,7 +71,7 @@ packages = ["qaura"]
 
 [tool.hatch.build.targets.sdist]
 # hatchling's sdist default is "everything not VCS-ignored" — without an explicit
-# include list that sweeps in runs*/ output and the 121KB internal build log
+# include list that sweeps in runs*/ output and the ~95KB internal build log
 # (docs/PROGRESS.md) alongside the actual package.
 include = [
     "/qaura",
@@ -83,6 +84,12 @@ include = [
     "/CHANGELOG.md",
     "/qaura.example.yaml",
 ]
+
+[tool.ruff]
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E9", "F", "B"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

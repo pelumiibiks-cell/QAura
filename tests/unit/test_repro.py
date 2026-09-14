@@ -122,3 +122,24 @@ def test_safe_id_strips_path_traversal(tmp_path):
     assert path.parent == tmp_path  # written inside out_dir, not above it
     assert ".." not in path.name
     assert "/" not in path.name and "\\" not in path.name
+
+
+def test_emit_skips_detectors_replay_cannot_check(tmp_path):
+    # A flow finding never re-runs its detector on replay, so its script would always pass
+    finding = _finding_with_steps()
+    finding.detector = "flow"
+    assert emit_repro_script(finding, tmp_path) is None
+
+
+def test_render_passes_storage_state_through():
+    script = render_repro_script(_finding_with_steps(), storage_state_path=".qaura/auth/user.json")
+    ast.parse(script)
+    assert "storage_state_path=STORAGE_STATE" in script
+    assert ".qaura/auth/user.json" in script
+    assert "pytest.skip" in script
+
+
+def test_render_without_storage_state_is_anonymous():
+    script = render_repro_script(_finding_with_steps())
+    ast.parse(script)
+    assert "STORAGE_STATE = None" in script

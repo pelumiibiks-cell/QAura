@@ -10,6 +10,7 @@ hallucinated one, which needs its own handling).
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass
 from pathlib import Path
@@ -17,7 +18,7 @@ from pathlib import Path
 from playwright.async_api import Page
 
 from qaura.browser.actions import Action, ActionError, ActionKind, execute
-from qaura.browser.observe import build_page_model
+from qaura.browser.observe import build_page_model, try_build_page_model
 from qaura.browser.recorder import Recorder
 from qaura.config import QAuraConfig
 from qaura.core.guardrails import (
@@ -60,6 +61,7 @@ class CrawlResult:
     graph: StateGraph
     actions_taken: int
     llm_usage: dict
+    aborted_reason: str | None = None
 
 
 def _describe(action: Action, ref: str, role: str, name: str) -> str:
@@ -95,6 +97,7 @@ class PersonaOrchestrator:
         # since Phase 1 and being an explicit deliverable from the original brief.
         self.screenshot_dir = screenshot_dir
         self._screenshot_counter = 0
+        self.aborted_reason: str | None = None
 
     def _collect_from_recorder(self, recorder: Recorder, url: str, repro_steps: list[ReproStep]) -> None:
         self.findings.extend(crash_detector.detect(recorder, url, repro_steps, self.persona.name))
@@ -132,10 +135,33 @@ class PersonaOrchestrator:
         self.findings.extend(await a11y_detector.detect(page, url, repro_steps, self.persona.name))
 
     async def run(self, page: Page, recorder: Recorder) -> CrawlResult:
-        await performance_detector.setup(page)  # must run before the first goto
-        await guard_goto(page, self.target_url, self.cfg.guardrails)
-        baseline_heap = await performance_detector.read_heap_size(page)
+        baseline_heap = None
+        try:
+            await performance_detector.setup(page)  # must run before the first goto
+            await guard_goto(page, self.target_url, self.cfg.guardrails)
+            baseline_heap = await performance_detector.read_heap_size(page)
+            await self._crawl(page, recorder)
+        except Exception as e:
+            # Same contract as HeuristicCrawler.run: keep findings, record why it stopped
+            self.aborted_reason = f"crawl stopped early at {page.url}: {type(e).__name__}: {e}"
+            _log.warning("%s", self.aborted_reason, exc_info=True)
+            try:
+                self._collect_from_recorder(recorder, page.url, list(self._action_history))
+            except Exception:
+                _log.debug("could not collect recorder findings after an abort", exc_info=True)
 
+        current_heap = await performance_detector.read_heap_size(page)
+        growth_finding = performance_detector.check_heap_growth(
+            baseline_heap, current_heap, page.url, self.persona.name,
+        )
+        if growth_finding:
+            self.findings.append(growth_finding)
+
+        return CrawlResult(
+            self.findings, self.graph, self.limiter.actions_taken, self.budget.summary(), self.aborted_reason,
+        )
+
+    async def _crawl(self, page: Page, recorder: Recorder) -> None:
         while True:
             try:
                 self.limiter.check_before_action()
@@ -143,7 +169,10 @@ class PersonaOrchestrator:
             except (BudgetStop, BudgetExceeded):
                 break
 
-            model = await build_page_model(page)
+            model = await try_build_page_model(page)
+            if model is None:
+                self.aborted_reason = f"page could not be observed at {page.url}"
+                break
             node = self.graph.visit(model)
             state_key = node.fingerprint.key()
             if node.visit_count == 1:
@@ -152,7 +181,9 @@ class PersonaOrchestrator:
                 await self._attach_screenshot(page, before)
 
             try:
-                action, planned, new_session = plan_next_action(
+                # Provider calls are synchronous with long timeouts, so keep them off the event loop
+                action, planned, new_session = await asyncio.to_thread(
+                    plan_next_action,
                     self.provider, self.persona.system_prompt, model, node.exercised_refs,
                     session=self._session_id, budget=self.budget,
                 )
@@ -191,7 +222,7 @@ class PersonaOrchestrator:
                 self.graph.mark_exercised(state_key, action.ref, element=element)
                 continue
 
-            self.limiter.throttle()
+            await self.limiter.throttle()
             description = _describe(action, element.ref, element.role, element.name)
             repro_step = ReproStep(
                 description=description, action_kind=action.kind.value, ref=action.ref,
@@ -226,7 +257,11 @@ class PersonaOrchestrator:
             # See heuristic.py's identical call for why: check_action() only validates
             # NAVIGATE actions, so a CLICK that follows an <a href> off-target is
             # otherwise never caught.
-            await enforce_scope_after_action(page, self.cfg.guardrails)
+            try:
+                await enforce_scope_after_action(page, self.cfg.guardrails)
+            except GuardrailViolation:
+                # Back didn't work; re-anchor on the target, and if that fails too run() records the stop
+                await guard_goto(page, self.target_url, self.cfg.guardrails)
 
             try:
                 new_model = await build_page_model(page)
@@ -258,7 +293,8 @@ class PersonaOrchestrator:
 
             if not rebuild_failed:
                 try:
-                    divergence = flow_detector.check(
+                    divergence = await asyncio.to_thread(
+                        flow_detector.check,
                         self.provider, action.expectation, model, new_model, description,
                         history, self.persona.name, budget=self.budget,
                     )
@@ -273,12 +309,3 @@ class PersonaOrchestrator:
                 if divergence:
                     self.findings.append(divergence)
             await self._attach_screenshot(page, before)
-
-        current_heap = await performance_detector.read_heap_size(page)
-        growth_finding = performance_detector.check_heap_growth(
-            baseline_heap, current_heap, page.url, self.persona.name,
-        )
-        if growth_finding:
-            self.findings.append(growth_finding)
-
-        return CrawlResult(self.findings, self.graph, self.limiter.actions_taken, self.budget.summary())

@@ -28,9 +28,9 @@ import json
 import logging
 import time
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
-from qaura.llm.base import ImagePart, LLMResponse, Tier, Usage
+from qaura.llm.base import ImagePart, LLMParseError, LLMResponse, Tier, Usage
 
 _log = logging.getLogger("qaura.llm.gemini")
 
@@ -42,6 +42,20 @@ _log = logging.getLogger("qaura.llm.gemini")
 _MAX_RETRIES = 2
 _RETRY_BACKOFF_SECONDS = 1.0
 _REQUEST_TIMEOUT_MS = 60_000
+
+# A retry can't fix a malformed request, a bad key, or a model ID that doesn't exist
+_NON_RETRYABLE_STATUS = {400, 401, 403, 404}
+
+
+def _status_code(error: Exception) -> int | None:
+    for candidate in (
+        getattr(error, "status_code", None),
+        getattr(error, "code", None),
+        getattr(getattr(error, "response", None), "status_code", None),
+    ):
+        if isinstance(candidate, int):
+            return candidate
+    return None
 
 
 def _rate_limit_error_class():
@@ -141,7 +155,7 @@ class GeminiProvider:
                 raise  # already on the fallback model, nothing cheaper to retry with
             return client.interactions.create(model=fallback_model, **kwargs)
 
-    def _create_with_retry(self, client, tier: Tier, model: str, kwargs: dict):
+    def _create_with_retry(self, client, tier: Tier, kwargs: dict):
         """Bounded retry with exponential backoff around _create_with_quota_fallback,
         for transient failures (network blips, 5xx) — NOT for rate limits, which
         already have their own permanent per-tier downgrade above and would just fail
@@ -153,12 +167,14 @@ class GeminiProvider:
         rate_limit_cls = _rate_limit_error_class()
         last_error: Exception | None = None
         for attempt in range(_MAX_RETRIES + 1):
+            # Re-resolved every attempt so a retry after a quota fallback stays on the fallback model
+            model = self._model_for(tier)
             try:
                 return self._create_with_quota_fallback(client, tier, model, kwargs)
             except Exception as e:
                 last_error = e
                 is_rate_limit = rate_limit_cls is not None and isinstance(e, rate_limit_cls)
-                if is_rate_limit or attempt == _MAX_RETRIES:
+                if is_rate_limit or _status_code(e) in _NON_RETRYABLE_STATUS or attempt == _MAX_RETRIES:
                     raise
                 _log.debug(
                     "Gemini call failed (attempt %d/%d) — retrying: %s",
@@ -178,7 +194,6 @@ class GeminiProvider:
         session: str | None = None,
     ) -> LLMResponse:
         client = self._client_or_raise()
-        model = self._model_for(tier)
 
         parts: list = []
         if images:
@@ -202,14 +217,17 @@ class GeminiProvider:
                 "schema": schema.model_json_schema(),
             }
 
-        interaction = self._create_with_retry(client, tier, model, kwargs)
+        interaction = self._create_with_retry(client, tier, kwargs)
 
         text = getattr(interaction, "output_text", "") or ""
+        usage = _extract_usage(interaction)
         parsed = None
         if schema is not None and text:
-            parsed = schema.model_validate_json(text)
+            try:
+                parsed = schema.model_validate_json(text)
+            except ValidationError as e:
+                raise LLMParseError(f"response did not match {schema.__name__}: {e}", usage=usage, text=text) from e
 
-        usage = _extract_usage(interaction)
         session_id = getattr(interaction, "id", None)
 
         return LLMResponse(
@@ -292,13 +310,13 @@ def run_doctor(cfg, console) -> None:
         from google import genai
     except ImportError:
         console.print("[red]google-genai is not installed.[/red] Run: pip install -e \".[dev,ml]\"")
-        raise SystemExit(1)
+        raise SystemExit(1) from None
 
     try:
         client = genai.Client(api_key=cfg.gemini_api_key)
     except Exception as e:
         console.print(f"[red]Failed to construct genai.Client:[/red] {e}")
-        raise SystemExit(1)
+        raise SystemExit(1) from None
 
     console.print("\n[bold]Reachable models:[/bold]")
     reachable: list[str] = []
@@ -317,16 +335,19 @@ def run_doctor(cfg, console) -> None:
 
     console.print("\n[bold]Checking configured tier models — reachability AND quota:[/bold]")
     console.print("[dim](makes one minimal live call per distinct model; this is what actually caught the Pro-tier quota-0 issue — a reachable-list check alone would have missed it)[/dim]")
-    # localize/invariant_candidates excluded: configured (ModelTiers has a field for
-    # each) but nothing in the codebase calls provider.complete() with either tier
-    # (see llm/base.py:Tier's docstring) — probing them would spend a live API call
-    # confirming quota for a model nothing actually uses yet.
+    # localize excluded: configured (ModelTiers has a field for it) but nothing calls
+    # provider.complete() with that tier — analysis/localize.py is deterministic (see
+    # llm/base.py:Tier's docstring) — so probing it would spend a live API call
+    # confirming quota for a model nothing actually uses yet. invariant_candidates IS
+    # probed: `qaura init` calls it, and a user finding out mid-recon that the tier is
+    # quota-blocked is exactly what doctor exists to prevent.
     configured = {
         "planner": cfg.model_tiers.planner,
         "planner_fallback": cfg.model_tiers.planner_fallback,
         "triage": cfg.model_tiers.triage,
         "fix": cfg.model_tiers.fix,
         "element_classify": cfg.model_tiers.element_classify,
+        "invariant_candidates": cfg.model_tiers.invariant_candidates,
         "visual_confirm": cfg.model_tiers.visual_confirm,
     }
     quota_blocked: list[str] = []
@@ -370,7 +391,7 @@ def run_doctor(cfg, console) -> None:
             "Check the installed SDK's actual surface (client.interactions vs "
             "client.models.generate_content) and update gemini.py + docs/PROGRESS.md.[/yellow]"
         )
-        raise SystemExit(1)
+        raise SystemExit(1) from None
 
     text = getattr(interaction, "output_text", None)
     console.print(f"  output_text: {text!r}")

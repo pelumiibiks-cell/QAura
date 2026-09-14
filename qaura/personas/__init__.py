@@ -1,5 +1,4 @@
-"""Persona registry — lets cli.py and core/planner_loop.py look personas up by the
-string names used in `qaura run --personas curious,impatient` and config.py's
+"""Persona registry. Lets cli.py look personas up by the string names used in `qaura run --personas curious,impatient` and config.py's
 PersonaConfig.enabled list, without every call site importing five modules by hand.
 """
 from qaura.personas.accessibility import PERSONA as ACCESSIBILITY

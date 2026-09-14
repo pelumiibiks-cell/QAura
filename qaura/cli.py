@@ -5,6 +5,8 @@ credential and reachable models before anything spends real API calls."""
 from __future__ import annotations
 
 import logging
+from pathlib import Path
+from urllib.parse import urlsplit
 
 import typer
 from rich.console import Console
@@ -30,7 +32,7 @@ def _load_config_or_exit(config_path: str | None):
         return load_config(config_path)
     except ConfigError as e:
         console.print(f"[red]Config error:[/red] {e}")
-        raise typer.Exit(code=1)
+        raise typer.Exit(code=1) from None
 
 
 _CI_SEVERITY_RANK = {"info": 0, "low": 1, "medium": 2, "high": 3, "critical": 4}
@@ -49,6 +51,33 @@ def _evaluate_ci_gate(findings, fail_on: str) -> tuple[bool, list]:
     return not offenders, offenders
 
 
+def _unique_dir(path: Path) -> Path:
+    """Run folders are timestamped to the second, so a second run in the same second gets a suffix."""
+    candidate, n = path, 2
+    while candidate.exists():
+        candidate = path.with_name(f"{path.name}_{n}")
+        n += 1
+    return candidate
+
+
+def _default_scope(cfg, url: str) -> str | None:
+    """Empty allowed_domains means every domain, so pin an unscoped run to the target host. Returns the host if applied."""
+    if cfg.guardrails.allowed_domains:
+        return None
+    host = urlsplit(url).hostname
+    if not host:
+        return None
+    cfg.guardrails.allowed_domains = [host]
+    return host
+
+
+def _single_url_scope(url: str):
+    from qaura.config import GuardrailConfig
+
+    host = urlsplit(url).hostname
+    return GuardrailConfig(allowed_domains=[host] if host else [])
+
+
 def _load_report_or_exit(path):
     """RunReport.load_json() has no schema-drift tolerance beyond
     reproducibility_status — a hand-edited or corrupted report.json raises a raw
@@ -60,7 +89,20 @@ def _load_report_or_exit(path):
         return RunReport.load_json(path)
     except Exception as e:
         console.print(f"[red]Could not load {path} as a QAura report:[/red] {e}")
-        raise typer.Exit(code=1)
+        raise typer.Exit(code=1) from None
+
+
+def _check_role_or_exit(role: str | None) -> None:
+    """--role becomes a file name under .qaura/auth, so reject anything path-like before it's used."""
+    from qaura.browser.auth import validate_role_name
+
+    if role is None:
+        return
+    try:
+        validate_role_name(role)
+    except ValueError as e:
+        console.print(f"[red]{e}[/red]")
+        raise typer.Exit(code=2) from None
 
 
 def _version_callback(value: bool) -> None:
@@ -117,6 +159,9 @@ def observe(
     from qaura.browser.auth import resolve_role
     from qaura.browser.driver import ContextSpec, Driver
     from qaura.browser.observe import build_page_model
+    from qaura.core.guardrails import guard_goto
+
+    _check_role_or_exit(role)
 
     async def _run() -> None:
         storage_state = resolve_role(role) if role else None
@@ -126,12 +171,234 @@ def observe(
         async with Driver(headless=headless) as driver:
             spec = ContextSpec(persona="observe", role=role, storage_state_path=storage_state)
             async with driver.context(spec) as (context, page):
-                await page.goto(url)
+                await guard_goto(page, url, _single_url_scope(url))
                 model = await build_page_model(page)
                 console.print(model.to_prompt())
                 console.print(f"\n[dim]signature: {model.signature()}  elements: {len(model.elements)}[/dim]")
 
     asyncio.run(_run())
+
+
+@app.command("init")
+def init_config(
+    url: str = typer.Option(..., "--url", help="Seed URL to analyze"),
+    role: str = typer.Option(None, "--role", help="Analyze through a captured auth session"),
+    out: str = typer.Option("qaura.generated.yaml", "--out", help="Where to write the proposal"),
+    max_pages: int = typer.Option(25, "--max-pages", help="Hard cap on pages visited"),
+    max_depth: int = typer.Option(2, "--max-depth", help="Link depth from the seed URL"),
+    no_llm: bool = typer.Option(False, "--no-llm",
+        help="Skip invariant synthesis. Guardrails, personas and admin paths are still inferred."),
+    interact_safe: bool = typer.Option(False, "--interact-safe",
+        help="Also click tabs and disclosure toggles to reveal hidden content. Never submits a form."),
+    login_form: bool = typer.Option(False, "--login-form",
+        help="On a login wall, try QAURA_LOGIN_USER/QAURA_LOGIN_PASS. Plain forms only — use "
+             "`qaura auth capture` for MFA/SSO. Permits exactly one POST."),
+    check: bool = typer.Option(False, "--check",
+        help="Don't generate. Report whether --config's invariant selectors still match the site."),
+    ignore_robots: bool = typer.Option(False, "--ignore-robots",
+        help="Crawl paths robots.txt disallows. For infrastructure you own."),
+    yes: bool = typer.Option(False, "--yes", help="Skip the interactive authorization prompt"),
+    force: bool = typer.Option(False, "--force", help="Overwrite an existing --out file"),
+    headless: bool = typer.Option(True, "--headless/--headed"),
+    config_path: str = typer.Option(None, "--config", "-c",
+        help="Existing config, read for the Gemini credential and model tiers. Never written to."),
+) -> None:
+    """Analyze a website and propose a qaura.yaml for it.
+
+    Runs a bounded, read-only crawl (GET and HEAD only, no form submissions), infers
+    guardrails, personas and admin paths from what it sees, synthesizes business-rule
+    invariants and validates them against captured page snapshots, then writes an
+    annotated proposal. Every value says how it was inferred and how much to trust it.
+
+    Never writes qaura.yaml. Review the output and adopt it yourself.
+    """
+    import asyncio
+    from pathlib import Path
+
+    from rich.markup import escape
+    from rich.table import Table
+
+    from qaura.browser.auth import DEFAULT_AUTH_DIR, resolve_role
+    from qaura.init import emit, infer
+    from qaura.init.candidates import annotate_durability, build_inventory, generate, sanity_filter
+    from qaura.init.consent import ConsentDeclined, is_remote_target, require_authorization
+    from qaura.init.limits import ReconLimits, recon_guardrails
+    from qaura.init.login import ADMIN_ROLE_NAMES, guidance
+    from qaura.init.recon import ChallengeDetected, probe_anon_differential, run_recon
+
+    cfg = _load_config_or_exit(config_path)
+    _check_role_or_exit(role)
+    remote = is_remote_target(url)
+    recon_cfg = recon_guardrails(url, remote=remote)
+    limits = ReconLimits().with_overrides(
+        max_pages=max_pages, max_depth=max_depth,
+        interact_safe=interact_safe, respect_robots=not ignore_robots,
+    )
+
+    try:
+        authorization = require_authorization(
+            url, console, max_pages=max_pages,
+            rps=recon_cfg.max_requests_per_second, assume_yes=yes, login_form=login_form,
+        )
+    except ConsentDeclined as e:
+        console.print(f"[yellow]{e}[/yellow]")
+        raise typer.Exit(code=2) from None
+
+    if check:
+        from qaura.init.check import check_invariants
+
+        if not cfg.invariants:
+            console.print("No invariants in the loaded config — nothing to check.")
+            raise typer.Exit(code=0)
+        results = asyncio.run(check_invariants(
+            cfg, url, storage_state=resolve_role(role) if role else None, headless=headless,
+        ))
+        table = Table(title=f"Invariant selector health — {url}")
+        table.add_column("invariant")
+        table.add_column("status")
+        table.add_column("detail")
+        for item in results:
+            colour = {"holds": "green", "violated": "red"}.get(item.status, "yellow")
+            # escape(): a CSS selector is mostly square brackets, which rich parses as
+            # console markup and silently swallows — so an unescaped detail line drops
+            # the exact selector the reader needs to see.
+            table.add_row(escape(item.name), f"[{colour}]{item.status}[/{colour}]",
+                          escape(item.detail))
+        console.print(table)
+        unhealthy = [r for r in results if not r.healthy]
+        if unhealthy:
+            console.print(f"[yellow]{len(unhealthy)} of {len(results)} invariant(s) did not hold "
+                          f"cleanly on this page.[/yellow]")
+            raise typer.Exit(code=1)
+        console.print(f"[green]All {len(results)} invariant(s) still apply.[/green]")
+        raise typer.Exit(code=0)
+
+    out_path = Path(out)
+    if out_path.exists() and not force:
+        console.print(f"[red]{out_path} already exists.[/red] Pass --force to overwrite it.")
+        raise typer.Exit(code=1)
+
+    storage_state = None
+    if role:
+        storage_state = resolve_role(role)
+        # With --login-form, `--role` names the session to CREATE, not one that must
+        # already exist — requiring it up front would make the two flags contradict each
+        # other and leave no way to say "log in and save it as this role".
+        if not storage_state and not login_form:
+            # Otherwise deliberately harsher than `observe`/`run`, which warn and
+            # continue anonymously. Silently emitting an anonymous-only config under
+            # --role admin would look authoritative while describing the logged-out shell.
+            console.print(f"[red]No captured session for role '{role}'.[/red]")
+            console.print(f"  qaura auth capture --url {url} --role {role}")
+            console.print("  ...or, for a plain username/password form:")
+            console.print(f"  QAURA_LOGIN_USER=... QAURA_LOGIN_PASS=... "
+                          f"qaura init --url {url} --role {role} --login-form")
+            raise typer.Exit(code=1)
+
+    console.print(f"Analyzing [bold]{url}[/bold] — read-only, at most {max_pages} pages.")
+    try:
+        result = asyncio.run(run_recon(
+            url, recon_cfg, limits, storage_state=storage_state, role=role,
+            headless=headless, console=console, login_form=login_form,
+            auth_dir=DEFAULT_AUTH_DIR,
+        ))
+    except ChallengeDetected as e:
+        console.print(f"[red]Bot protection detected:[/red] {e.signal.describe()}")
+        console.print("Recon stopped. A config derived from a challenge page would describe the "
+                      "challenge, not the app. No file was written.")
+        raise typer.Exit(code=3) from None
+
+    console.print(
+        f"  {result.attempted} navigation(s), {len(result.states)} distinct state(s), "
+        f"{result.ledger.summary()}."
+    )
+
+    if result.login.walled and not role:
+        for line in guidance(result.login, url, role, len(result.states)):
+            console.print(f"[yellow]{escape(line)}[/yellow]" if line else "")
+
+    if role and role.lower() in ADMIN_ROLE_NAMES and result.discovered_paths:
+        console.print("  Measuring which paths are actually privileged...")
+        result.admin_measured = asyncio.run(probe_anon_differential(
+            sorted(set(result.discovered_paths)), url, recon_cfg, limits, headless=headless,
+        ))
+
+    verdicts = []
+    llm_used = False
+    if not no_llm and cfg.effective_llm_mode == "gemini":
+        from qaura.llm.budget import Budget
+        from qaura.llm.gemini import GeminiProvider
+
+        entries = build_inventory(result.states)
+        if entries:
+            llm_used = True
+            console.print(f"  {len(entries)} addressable number(s) found; proposing invariants...")
+            provider = GeminiProvider(cfg.gemini_api_key, cfg.model_tiers)
+            raw = generate(provider, entries, Budget(max_calls=limits.max_llm_calls))
+            accepted, rejected = [], []
+            for candidate in raw:
+                outcome = sanity_filter(candidate, entries)
+                (accepted if hasattr(outcome, "expression") else rejected).append(outcome)
+            for bad in rejected:
+                _log.debug("candidate %r rejected: %s", bad.candidate.name, bad.reason)
+            if accepted:
+                verdicts = asyncio.run(_validate_candidates(accepted, result.snapshots, headless))
+                annotate_durability(verdicts, entries)
+        else:
+            console.print("  No addressable numbers found; skipping invariant synthesis.")
+    elif not no_llm:
+        console.print("  No Gemini credential; skipping invariant synthesis (--no-llm equivalent).")
+
+    proposal = infer.build_proposal(
+        result, verdicts,
+        command=f"qaura init --url {url}" + (f" --role {role}" if role else ""),
+        version=__version__, authorization=authorization, llm_used=llm_used,
+    )
+    rendered = emit.render_config(proposal)
+    try:
+        emit.assert_loadable(rendered)
+    except Exception as e:
+        console.print(f"[red]Generated config failed its own validation:[/red] {e}")
+        console.print("This is a bug in qaura init. No file was written.")
+        raise typer.Exit(code=4) from None
+
+    emit.write_generated(rendered, out_path, force=force)
+
+    table = Table(title="Proposed configuration")
+    table.add_column("field")
+    table.add_column("value", overflow="fold")
+    table.add_column("confidence")
+    for annotated in proposal.fields:
+        value = annotated.value
+        rendered_value = ", ".join(map(str, value)) if isinstance(value, list) else str(value)
+        if isinstance(value, dict):
+            rendered_value = ", ".join(f"{k}={v}" for k, v in list(value.items())[:4])
+        suffix = " (commented out)" if annotated.commented_out else ""
+        table.add_row(annotated.key, escape(rendered_value[:100]) + suffix,
+                      annotated.confidence.value)
+    console.print(table)
+
+    accepted_v = [v for v in verdicts if v.status == "accepted"]
+    console.print(
+        f"Invariants: {len(accepted_v)} accepted, "
+        f"{sum(1 for v in verdicts if v.status == 'rejected_violated')} rejected, "
+        f"{sum(1 for v in verdicts if v.status == 'unverified')} unverified."
+    )
+    console.print(f"[green]Wrote {out_path}[/green] — review it, then: "
+                  f"qaura run --config {out_path}")
+
+
+async def _validate_candidates(invariants, snapshots, headless: bool):
+    """Replays candidates against captured HTML in a context where every request is
+    aborted, so set_content() cannot re-fetch a single asset from the target."""
+    from qaura.browser.driver import ContextSpec, Driver
+    from qaura.browser.readonly import install_offline_routes
+    from qaura.init.candidates import validate
+
+    async with Driver(headless=headless) as driver:
+        async with driver.context(ContextSpec(persona="init-validate")) as (context, page):
+            await install_offline_routes(context)
+            return await validate(page, invariants, snapshots)
 
 
 auth_app = typer.Typer(help="Capture and manage storage-state auth sessions.")
@@ -153,6 +420,7 @@ def auth_capture(
         console.print(f"Log in as '{ready_role}', then come back here and press Enter to save the session.")
         input()
 
+    _check_role_or_exit(role)
     path = asyncio.run(capture(url, role, on_ready=_prompt))
     console.print(f"[green]Saved session for role '{role}' to {path}[/green]")
 
@@ -204,10 +472,18 @@ def run(
     from qaura.reporting.models import Finding, RunReport, RunSummary
 
     cfg = _load_config_or_exit(config_path)
+    if ci and fail_on.lower() not in _CI_SEVERITY_RANK:
+        # Checked up front so a typo doesn't cost a whole crawl before it's noticed
+        console.print(f"[red]--fail-on must be one of {sorted(_CI_SEVERITY_RANK)}, got {fail_on!r}[/red]")
+        raise typer.Exit(code=2)
+    _check_role_or_exit(role)
     target = url or cfg.target_url
     if not target:
         console.print("[red]No target URL given.[/red] Pass --url or set target_url in qaura.yaml.")
         raise typer.Exit(code=1)
+    scoped_host = _default_scope(cfg, target)
+    if scoped_host:
+        console.print(f"[dim]No guardrails.allowed_domains configured; this run is limited to {scoped_host}.[/dim]")
 
     from qaura.browser.auth import resolve_role
 
@@ -222,10 +498,11 @@ def run(
         reason = "no_llm was set" if no_llm else "no Gemini credential is configured (run `qaura doctor`)"
         console.print(f"[yellow]--personas requested but {reason} — falling back to heuristic mode.[/yellow]")
 
-    out_dir = Path(out or cfg.output_dir) / datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_dir = _unique_dir(Path(out or cfg.output_dir) / datetime.now().strftime("%Y%m%d_%H%M%S"))
     screenshot_dir = Path(out_dir) / "screenshots"
     trace_dir = Path(out_dir) / "traces"
     trace_paths: dict[str, str] = {}
+    run_notes: list[str] = []
 
     # One RunLimiter and one Budget for the entire run, per guardrails.py's own
     # documented contract ("a run with 5 personas shouldn't get 5x the action
@@ -252,6 +529,8 @@ def run(
                         trace_paths["heuristic"] = str(saved)
         coverage = result.graph.coverage_summary()
         coverage["unreached"] = [f"{role}: {name!r} ({template})" for template, role, name in result.graph.unreached_elements()]
+        if result.aborted_reason:
+            run_notes.append(result.aborted_reason)
         return result.findings, coverage, None
 
     async def _run_personas() -> tuple[list[Finding], dict, dict]:
@@ -273,15 +552,24 @@ def run(
                     limiter=run_limiter, budget=run_budget,
                 )
                 spec = ContextSpec(persona=persona.name, role=role, storage_state_path=storage_state)
-                async with driver.context(spec) as (context, page):
-                    recorder = Recorder(page, context)
-                    await recorder.start(trace=trace)
-                    with console.status(f"Running persona '{persona.name}' against {target}..."):
-                        result = await orchestrator.run(page, recorder)
-                    if trace:
-                        saved = await recorder.stop_and_save_trace(trace_dir / f"{persona.name}.zip")
-                        if saved:
-                            trace_paths[persona.name] = str(saved)
+                try:
+                    async with driver.context(spec) as (context, page):
+                        recorder = Recorder(page, context)
+                        await recorder.start(trace=trace)
+                        with console.status(f"Running persona '{persona.name}' against {target}..."):
+                            result = await orchestrator.run(page, recorder)
+                        if trace:
+                            saved = await recorder.stop_and_save_trace(trace_dir / f"{persona.name}.zip")
+                            if saved:
+                                trace_paths[persona.name] = str(saved)
+                except Exception as e:
+                    # One broken persona context shouldn't cost the other personas their findings
+                    _log.debug("persona %s failed", persona.name, exc_info=True)
+                    run_notes.append(f"persona {persona.name!r} stopped early: {type(e).__name__}: {e}")
+                    all_findings.extend(orchestrator.findings)
+                    continue
+                if result.aborted_reason:
+                    run_notes.append(f"persona {persona.name!r}: {result.aborted_reason}")
 
                 all_findings.extend(result.findings)
                 persona_coverage = result.graph.coverage_summary()
@@ -343,12 +631,15 @@ def run(
         else:
             findings, coverage, llm_usage = await _run_heuristic()
             mode = "heuristic"
-        findings.extend(await _check_cross_role())
+        try:
+            findings.extend(await _check_cross_role())
+        except Exception as e:
+            run_notes.append(f"cross-role check failed: {type(e).__name__}: {e}")
         finished_at = datetime.now(timezone.utc).isoformat()
         summary = RunSummary(
             target_url=target, started_at=started_at, finished_at=finished_at,
             mode=mode, personas=persona_names if use_llm else [], coverage=coverage,
-            llm_usage=llm_usage, trace_paths=dict(trace_paths),
+            llm_usage=llm_usage, trace_paths=dict(trace_paths), notes=list(run_notes),
         )
         return RunReport(summary=summary, findings=findings)
 
@@ -471,7 +762,7 @@ def run(
         repro_dir = Path(out_dir) / "repro"
         emitted = 0
         for f in findings:
-            script_path = emit_repro_script(f, repro_dir, invariants=cfg.invariants)
+            script_path = emit_repro_script(f, repro_dir, invariants=cfg.invariants, storage_state_path=storage_state)
             if script_path is not None:
                 f.repro_script_path = str(script_path)
                 emitted += 1
@@ -481,7 +772,13 @@ def run(
         report.findings = findings
         return report
 
-    report = asyncio.run(_run())
+    try:
+        report = asyncio.run(_run())
+    except Exception as e:
+        # Crawlers keep their own partial results, so reaching here means nothing ran (e.g. no browser)
+        _log.debug("run failed", exc_info=True)
+        console.print(f"[red]Run failed before any findings were collected:[/red] {type(e).__name__}: {e}")
+        raise typer.Exit(code=1) from None
     # Save immediately after the crawl, before analysis runs — analysis makes
     # unguarded LLM calls, launches a fresh browser for replay, and walks the
     # filesystem for localization, any of which can raise. Previously report.json
@@ -522,6 +819,8 @@ def run(
 
     console.print(f"\n[bold]Run complete.[/bold] {len(report.findings)} finding(s).")
     console.print(f"Coverage: {report.summary.coverage}")
+    for note in report.summary.notes:
+        console.print(f"[yellow]Note:[/yellow] {note}")
     if report.summary.llm_usage:
         console.print(f"LLM usage: {report.summary.llm_usage}")
     if report.summary.trace_paths:
@@ -535,7 +834,7 @@ def run(
             passed, offenders = _evaluate_ci_gate(report.findings, fail_on)
         except ValueError as e:
             console.print(f"[red]{e}[/red]")
-            raise typer.Exit(code=2)
+            raise typer.Exit(code=2) from None
         if not passed:
             console.print(
                 f"\n[bold red]CI gate: FAIL[/bold red] — {len(offenders)} finding(s) at or above "
@@ -581,6 +880,7 @@ def replay(
         raise typer.Exit(code=1)
 
     cfg = _load_config_or_exit(config_path)
+    _check_role_or_exit(role)
 
     storage_state = resolve_role(role) if role else None
     if role and not storage_state:
@@ -652,7 +952,7 @@ def ml_test(
         import pandas as pd
     except ImportError:
         console.print("[red]`qaura ml test` needs the 'ml' extra:[/red] pip install -e \".[ml]\"")
-        raise typer.Exit(code=1)
+        raise typer.Exit(code=1) from None
 
     from qaura.mltest.registry import ModelLoadError, load_model
     from qaura.mltest.report import build_run_report, overall_gate
@@ -664,13 +964,13 @@ def ml_test(
         loaded_baseline = load_model(baseline) if baseline else None
     except ModelLoadError as e:
         console.print(f"[red]{e}[/red]")
-        raise typer.Exit(code=1)
+        raise typer.Exit(code=1) from None
 
     try:
         df = pd.read_csv(data)
     except (FileNotFoundError, pd.errors.ParserError, pd.errors.EmptyDataError) as e:
         console.print(f"[red]Could not read {data} as CSV:[/red] {e}")
-        raise typer.Exit(code=1)
+        raise typer.Exit(code=1) from None
     cols = [c.strip() for c in feature_cols.split(",")] if feature_cols else [
         c for c in df.columns if c not in {label_col, slice_col}
     ]
@@ -681,7 +981,7 @@ def ml_test(
 
     report = build_run_report(model, result.findings, mode="ml_artifact", metrics=result.metrics)
     gate = overall_gate(result.findings)
-    out_dir = Path(out or "runs") / f"ml_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    out_dir = _unique_dir(Path(out or "runs") / f"ml_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
     json_path = report.save_json(out_dir / "report.json")
     html_path = save_html(report, out_dir / "report.html")
 
@@ -713,7 +1013,7 @@ def ml_data(
         import pandas as pd
     except ImportError:
         console.print("[red]`qaura ml data` needs the 'ml' extra:[/red] pip install -e \".[ml]\"")
-        raise typer.Exit(code=1)
+        raise typer.Exit(code=1) from None
 
     from qaura.mltest.report import build_run_report, overall_gate
     from qaura.mltest.suites.data import check_drift, check_leakage, check_null_rate_shift, check_schema
@@ -724,7 +1024,7 @@ def ml_data(
         current_df = pd.read_csv(current)
     except (FileNotFoundError, pd.errors.ParserError, pd.errors.EmptyDataError) as e:
         console.print(f"[red]Could not read a CSV:[/red] {e}")
-        raise typer.Exit(code=1)
+        raise typer.Exit(code=1) from None
 
     check_cols = (
         [c.strip() for c in columns.split(",")] if columns
@@ -743,7 +1043,7 @@ def ml_data(
 
     report = build_run_report(current, findings, mode="ml_data")
     gate = overall_gate(findings)
-    out_dir = Path(out or "runs") / f"ml_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    out_dir = _unique_dir(Path(out or "runs") / f"ml_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
     json_path = report.save_json(out_dir / "report.json")
     html_path = save_html(report, out_dir / "report.html")
 
@@ -775,14 +1075,14 @@ def ml_probe(
         base_payload = json_lib.loads(payload)
     except json_lib.JSONDecodeError as e:
         console.print(f"[red]--payload is not valid JSON: {e}[/red]")
-        raise typer.Exit(code=1)
+        raise typer.Exit(code=1) from None
 
     with console.status(f"Probing {endpoint}..."):
         result = asyncio.run(probe_endpoint(endpoint, base_payload, method=method))
 
     report = build_run_report(endpoint, result.findings, mode="ml_endpoint")
     gate = overall_gate(result.findings)
-    out_dir = Path(out or "runs") / f"ml_endpoint_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    out_dir = _unique_dir(Path(out or "runs") / f"ml_endpoint_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
     json_path = report.save_json(out_dir / "report.json")
     html_path = save_html(report, out_dir / "report.html")
 
@@ -812,10 +1112,12 @@ def ml_genai(
 
     from qaura.browser.auth import resolve_role
     from qaura.browser.driver import ContextSpec, Driver
+    from qaura.core.guardrails import guard_goto
     from qaura.mltest.report import build_run_report, overall_gate
     from qaura.mltest.suites.genai import GenAIProbeConfig, run_genai_suite
     from qaura.reporting.html import save_html
 
+    _check_role_or_exit(role)
     storage_state = resolve_role(role) if role else None
     if role and not storage_state:
         console.print(f"[yellow]No captured session for role '{role}' — continuing unauthenticated.[/yellow]")
@@ -826,14 +1128,14 @@ def ml_genai(
         async with Driver(headless=headless) as driver:
             spec = ContextSpec(persona="genai-probe", role=role, storage_state_path=storage_state)
             async with driver.context(spec) as (_, page):
-                await page.goto(url)
+                await guard_goto(page, url, _single_url_scope(url))
                 with console.status(f"Probing GenAI feature at {url}..."):
                     return await run_genai_suite(page, config, url, refusal_probe=refusal_probe)
 
     findings = asyncio.run(_run())
     report = build_run_report(url, findings, mode="ml_genai")
     gate = overall_gate(findings)
-    out_dir = Path(out or "runs") / f"ml_genai_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    out_dir = _unique_dir(Path(out or "runs") / f"ml_genai_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
     json_path = report.save_json(out_dir / "report.json")
     html_path = save_html(report, out_dir / "report.html")
 
